@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">NavBar DoubleTap2Lock</string>
-    <string name="module_description">Navigasyon çubuğuna çift tıklayarak ekranı kapatma modülü. Hareketle gezinme ve 3 düğmeli gezinme destekler.</string>
+    <string name="module_description">Double-tap the navigation bar to lock the screen. Supports gesture and 3-button navigation.</string>
 
     <string-array name="xposed_scope">
         <item>com.android.systemui</item>

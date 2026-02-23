@@ -1,107 +1,103 @@
 # NavBar DoubleTap2Lock
 
-Navigasyon cubugunun herhangi bir yerine cift tiklayarak ekrani kapatan LSPosed / Xposed moduludur.
+An LSPosed / Xposed module that locks the screen when you double-tap anywhere on the navigation bar.
 
-## Nasil Calisir?
+## How It Works
 
-Modul, `com.android.systemui` icindeki `NavigationBarView.dispatchTouchEvent` metodunu hooklar. Dokunma olaylarini izleyerek ard arda gelen iki hizli tiklamayi (double tap) algilar ve ekrani kapatir.
+The module hooks `NavigationBarView.dispatchTouchEvent` inside `com.android.systemui`. It monitors touch events, detects two consecutive quick taps (double tap), and turns off the screen.
 
-### Gezinme Moduna Gore Davranis
+### Behavior by Navigation Mode
 
-| Gezinme Modu | Durum | Sonuc |
+| Navigation Mode | Condition | Result |
 |---|---|---|
-| 3 dugmeli gezinme | - | Her zaman aktif |
-| 2 dugmeli gezinme | - | Her zaman aktif |
-| Hareketle gezinme | Ipucu cizgisi **gorunur** | Aktif |
-| Hareketle gezinme | Ipucu cizgisi **gizli** | Devre disi |
+| 3-button navigation | - | Always active |
+| 2-button navigation | - | Always active |
+| Gesture navigation | Hint bar **visible** | Active |
+| Gesture navigation | Hint bar **hidden** | Disabled |
 
-Hareketle gezinmede ipucu cizgisi (en alttaki ince beyaz cizgi) gizlendiginde, dokunuslar navigasyon cubugundan gecip alttaki uygulamaya iletilir. Bu durumda moduldeki cift tiklama ozelligi devre disi kalir.
+In gesture navigation, when the hint bar (the thin line at the bottom) is hidden, touches pass through the navigation bar to the app underneath. The double-tap feature is disabled in this case to avoid conflicts.
 
-## Gereksinimler
+## Requirements
 
 - Android 10+ (API 29)
-- Root erisimi (Magisk / KernelSU)
-- LSPosed veya Xposed Framework
+- Root access (Magisk / KernelSU)
+- LSPosed or Xposed Framework
 
-## Kurulum
+## Installation
 
-### 1. Projeyi Derleme
+### 1. Build the Project
 
-```
-XposedBridgeAPI-89.jar dosyasini app/lib/ klasorune koyun.
-```
+Place `XposedBridgeAPI-89.jar` in the `app/lib/` directory. You can obtain the JAR from [XposedBridge releases](https://github.com/rovo89/XposedBridge/releases) or from an existing Xposed module project.
 
-JAR dosyasini [XposedBridge releases](https://github.com/rovo89/XposedBridge/releases) sayfasindan veya mevcut bir Xposed modul projesinden alabilirsiniz.
-
-Ardindan projeyi Android Studio ile acin ve derleyin:
+Then open the project in Android Studio and build:
 
 ```
 Build > Build Bundle(s) / APK(s) > Build APK(s)
 ```
 
-### 2. APK Yukleme
+### 2. Install the APK
 
-Derlenen APK dosyasini cihaza yukleyin.
+Install the compiled APK on your device.
 
-### 3. Modul Etkinlestirme
+### 3. Enable the Module
 
-1. LSPosed Manager'i acin
-2. Modul listesinden **NavBar DoubleTap2Lock** modulunu bulun ve etkinlestirin
-3. Kapsam (scope) olarak **System UI** secili oldugundan emin olun
-4. Cihazi yeniden baslatin
+1. Open LSPosed Manager
+2. Find **NavBar DoubleTap2Lock** in the module list and enable it
+3. Make sure **System UI** is selected as the scope
+4. Reboot the device
 
-## Proje Yapisi
+## Project Structure
 
 ```
 app/src/main/
 ├── assets/
-│   └── xposed_init                       # Modul giris noktasi
+│   └── xposed_init                       # Module entry point
 ├── java/com/navbardoubletap2lock/
-│   └── MainHook.java                     # Tum hook ve mantik kodu
+│   └── MainHook.java                     # All hook and logic code
 ├── res/values/
-│   └── strings.xml                       # Modul adi, aciklama, scope
+│   └── strings.xml                       # Module name, description, scope
 └── AndroidManifest.xml                   # Xposed metadata
 ```
 
-## Teknik Detaylar
+## Technical Details
 
-### Cift Tiklama Algilama
+### Double-Tap Detection
 
-- `ACTION_DOWN` ile parmak pozisyonu ve zamani kaydedilir
-- `ACTION_UP` geldiginde sure (`< 300ms`) ve mesafe (`< 100px`) kontrol edilir; kosullari sagliyorsa gecerli bir tiklama sayilir
-- Iki ardisik tiklama arasi sure `ViewConfiguration.getDoubleTapTimeout()` degerini asmiyorsa cift tiklama onaylanir
-- Kaydirma (swipe) ve uzun basma hareketleri otomatik olarak filtrelenir
+- On `ACTION_DOWN`, the finger position and timestamp are recorded
+- On `ACTION_UP`, duration (`< 300ms`) and distance (`< 100px`) are checked; if both pass, it counts as a valid tap
+- If two consecutive taps occur within `ViewConfiguration.getDoubleTapTimeout()`, a double tap is confirmed
+- Swipes and long presses are automatically filtered out
 
-### Gezinme Modu Tespiti
+### Navigation Mode Detection
 
-Sistem kaynagindan `config_navBarInteractionMode` degeri okunur (SystemUI'nin kendi kullandigi yontem). Okunamazsa `Settings.Secure "navigation_mode"` degerine bakilir.
+The `config_navBarInteractionMode` value is read from the system resource (the same method SystemUI uses internally). If that fails, it falls back to `Settings.Secure "navigation_mode"`.
 
-- `0` = 3 dugmeli gezinme
-- `1` = 2 dugmeli gezinme
-- `2` = Hareketle gezinme
+- `0` = 3-button navigation
+- `1` = 2-button navigation
+- `2` = Gesture navigation
 
-### Ipucu Cizgisi Gorunurlugu
+### Hint Bar Visibility
 
-Hareketle gezinme modunda, navigasyon cubugu icindeki ipucu cizgisi gorunurlugu iki yontemle kontrol edilir:
+In gesture navigation mode, the hint bar visibility inside the navigation bar is checked using two methods:
 
-1. `home_handle` resource ID ile view aranir
-2. Bulunamazsa `NavigationHandle` sinif adiyla recursive arama yapilir
+1. Search for the view by the `home_handle` resource ID
+2. If not found, recursively search by the `NavigationHandle` class name
 
-Bulunan view'in hem `visibility == VISIBLE` hem de `alpha > 0` olmasi gerekir.
+The view must have both `visibility == VISIBLE` and `alpha > 0` to be considered visible.
 
-### Ekran Kapatma
+### Screen Lock
 
-SystemUI prosesi `DEVICE_POWER` iznine sahip oldugu icin, `PowerManager.goToSleep()` metodu reflection ile cagrilarak ekran kapatilir.
+Since the SystemUI process holds the `DEVICE_POWER` permission, the screen is turned off by calling `PowerManager.goToSleep()` via reflection.
 
-## Uyumluluk
+## Compatibility
 
-| Android Surumu | NavigationBarView Yolu |
+| Android Version | NavigationBarView Path |
 |---|---|
 | 12+ (S) | `com.android.systemui.navigationbar.NavigationBarView` |
 | 10-11 (Q, R) | `com.android.systemui.statusbar.phone.NavigationBarView` |
 
-Modul her iki sinif yolunu da sirayla dener; hangisi bulunursa onu hooklar.
+The module tries both class paths in order and hooks whichever one is found.
 
-## Lisans
+## License
 
 GPL-3.0
