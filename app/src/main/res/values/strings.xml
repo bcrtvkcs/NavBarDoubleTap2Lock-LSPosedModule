@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">NavBar DoubleTap2Lock</string>
+    <string name="module_description">Navigasyon çubuğuna çift tıklayarak ekranı kapatma modülü. Hareketle gezinme ve 3 düğmeli gezinme destekler.</string>
+
+    <string-array name="xposed_scope">
+        <item>com.android.systemui</item>
+    </string-array>
+</resources>
