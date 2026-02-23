@@ -27,7 +27,7 @@ In gesture navigation, when the hint bar (the thin line at the bottom) is hidden
 
 ### 1. Build the Project
 
-Place `XposedBridgeAPI-89.jar` in the `app/lib/` directory. You can obtain the JAR from [XposedBridge releases](https://github.com/rovo89/XposedBridge/releases) or from an existing Xposed module project.
+Place `XposedBridgeAPI-89.jar` in the `app/lib/` directory. You can obtain the JAR from the [LSPosed API releases](https://github.com/libxposed/api/releases) or extract it from an existing Xposed module project.
 
 Then open the project in Android Studio and build:
 
