@@ -48,8 +48,9 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private Class<?> findNavigationBarViewClass(ClassLoader classLoader) {
         String[] classPaths = {
-                "com.android.systemui.navigationbar.NavigationBarView",
-                "com.android.systemui.statusbar.phone.NavigationBarView"
+                "com.android.systemui.navigationbar.views.NavigationBarView", // Android 16+
+                "com.android.systemui.navigationbar.NavigationBarView",       // Android 12L-15
+                "com.android.systemui.statusbar.phone.NavigationBarView"      // Android ≤ 12
         };
 
         for (String path : classPaths) {
