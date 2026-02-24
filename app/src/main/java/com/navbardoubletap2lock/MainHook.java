@@ -12,6 +12,7 @@ import android.view.ViewGroup;
 import io.github.libxposed.api.XposedInterface;
 import io.github.libxposed.api.XposedModule;
 import io.github.libxposed.api.XposedModuleInterface;
+import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam;
 
 import java.lang.reflect.Method;
 
