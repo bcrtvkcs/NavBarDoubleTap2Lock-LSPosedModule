@@ -3,6 +3,8 @@ package com.navbardoubletap2lock;
 import android.content.Context;
 import android.os.PowerManager;
 import android.os.SystemClock;
+import android.view.InputEvent;
+import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
@@ -25,9 +27,12 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final long TAP_MAX_DURATION = 300;
     private static final float TAP_MAX_DISTANCE = 100f;
 
+    private static final long LOCK_COOLDOWN_MS = 500;
+
     private float downX, downY;
     private long downTime;
     private long lastTapTime;
+    private long lastLockTime;
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
@@ -112,10 +117,16 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (lastTapTime > 0 && (now - lastTapTime) <= doubleTapTimeout) {
                         lastTapTime = 0;
 
+                        long currentTime = SystemClock.uptimeMillis();
+                        if (currentTime - lastLockTime < LOCK_COOLDOWN_MS) {
+                            break;
+                        }
+
                         Context context = navBarView.getContext();
                         if (shouldHandleDoubleTap(context, navBarView, downX, downY)) {
+                            lastLockTime = currentTime;
                             XposedBridge.log(TAG + ": Double tap detected - locking screen");
-                            lockScreen(context);
+                            navBarView.postDelayed(() -> lockScreen(context), 150);
                         }
                     } else {
                         lastTapTime = now;
@@ -238,23 +249,76 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private void lockScreen(Context context) {
+        if (tryGoToSleep(context)) return;
+        if (tryInjectSleepKey(context)) return;
+        tryShellSleepCommand();
+    }
+
+    private boolean tryGoToSleep(Context context) {
         try {
             PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
-            if (pm == null) {
-                XposedBridge.log(TAG + ": PowerManager is null");
-                return;
-            }
+            if (pm == null) return false;
 
+            XposedBridge.log(TAG + ": Trying goToSleep...");
             try {
                 Method goToSleep = PowerManager.class.getMethod(
                         "goToSleep", long.class, int.class, int.class);
-                goToSleep.invoke(pm, SystemClock.uptimeMillis(), 0, 0);
+                goToSleep.invoke(pm, SystemClock.uptimeMillis(), 4, 0); // reason=4 (POWER_BUTTON)
             } catch (NoSuchMethodException e) {
                 Method goToSleep = PowerManager.class.getMethod("goToSleep", long.class);
                 goToSleep.invoke(pm, SystemClock.uptimeMillis());
             }
+
+            Thread.sleep(50);
+            if (!pm.isInteractive()) {
+                XposedBridge.log(TAG + ": goToSleep succeeded");
+                return true;
+            }
+            XposedBridge.log(TAG + ": goToSleep called but screen still on");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": Error locking screen: " + t.getMessage());
+            XposedBridge.log(TAG + ": goToSleep failed: " + t.getMessage());
+        }
+        return false;
+    }
+
+    private boolean tryInjectSleepKey(Context context) {
+        try {
+            XposedBridge.log(TAG + ": Trying KEYCODE_SLEEP injection...");
+            Object inputManager = context.getSystemService(Context.INPUT_SERVICE);
+            if (inputManager == null) {
+                XposedBridge.log(TAG + ": InputManager is null");
+                return false;
+            }
+
+            long now = SystemClock.uptimeMillis();
+            KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_SLEEP, 0);
+            KeyEvent up = new KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_SLEEP, 0);
+
+            Method injectMethod = inputManager.getClass().getMethod(
+                    "injectInputEvent", InputEvent.class, int.class);
+            injectMethod.invoke(inputManager, down, 0); // INJECT_INPUT_EVENT_MODE_ASYNC
+            injectMethod.invoke(inputManager, up, 0);
+
+            Thread.sleep(50);
+            PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+            if (pm != null && !pm.isInteractive()) {
+                XposedBridge.log(TAG + ": KEYCODE_SLEEP injection succeeded");
+                return true;
+            }
+            XposedBridge.log(TAG + ": KEYCODE_SLEEP injected but screen still on");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": KEYCODE_SLEEP injection failed: " + t.getMessage());
+        }
+        return false;
+    }
+
+    private void tryShellSleepCommand() {
+        try {
+            XposedBridge.log(TAG + ": Trying shell command...");
+            Runtime.getRuntime().exec(new String[]{"input", "keyevent", "223"});
+            XposedBridge.log(TAG + ": Shell command sent");
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": Shell command failed: " + t.getMessage());
         }
     }
 }
