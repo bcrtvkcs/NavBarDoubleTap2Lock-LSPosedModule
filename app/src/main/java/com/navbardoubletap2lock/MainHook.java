@@ -3,7 +3,10 @@ package com.navbardoubletap2lock;
 import android.content.Context;
 import android.os.PowerManager;
 import android.os.SystemClock;
+import android.util.Log;
+import android.view.InputDevice;
 import android.view.InputEvent;
+import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
@@ -29,6 +32,12 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final long LOCK_COOLDOWN_MS = 500;
 
+    private static void log(String msg) {
+        String fullMsg = TAG + ": " + msg;
+        XposedBridge.log(fullMsg);
+        Log.d(TAG, msg);
+    }
+
     private float downX, downY;
     private long downTime;
     private long lastTapTime;
@@ -40,11 +49,11 @@ public class MainHook implements IXposedHookLoadPackage {
             return;
         }
 
-        XposedBridge.log(TAG + ": Loaded in SystemUI");
+        log("Loaded in SystemUI");
 
         Class<?> navBarViewClass = findNavigationBarViewClass(lpparam.classLoader);
         if (navBarViewClass == null) {
-            XposedBridge.log(TAG + ": NavigationBarView class not found, aborting");
+            log("NavigationBarView class not found, aborting");
             return;
         }
 
@@ -61,7 +70,7 @@ public class MainHook implements IXposedHookLoadPackage {
         for (String path : classPaths) {
             try {
                 Class<?> cls = Class.forName(path, false, classLoader);
-                XposedBridge.log(TAG + ": Found NavigationBarView at " + path);
+                log("Found NavigationBarView at " + path);
                 return cls;
             } catch (ClassNotFoundException ignored) {
             }
@@ -83,14 +92,14 @@ public class MainHook implements IXposedHookLoadPackage {
                         MotionEvent event = (MotionEvent) param.args[0];
                         handleTouchForDoubleTap(navBarView, event);
                     } catch (Throwable t) {
-                        XposedBridge.log(TAG + ": Error in hook callback: " + t.getMessage());
+                        log("Error in hook callback: " + t.getMessage());
                     }
                 }
             });
 
-            XposedBridge.log(TAG + ": dispatchTouchEvent hook installed on NavigationBarView");
+            log("dispatchTouchEvent hook installed on NavigationBarView");
         } catch (NoSuchMethodException e) {
-            XposedBridge.log(TAG + ": dispatchTouchEvent method not found: " + e.getMessage());
+            log("dispatchTouchEvent method not found: " + e.getMessage());
         }
     }
 
@@ -125,8 +134,8 @@ public class MainHook implements IXposedHookLoadPackage {
                         Context context = navBarView.getContext();
                         if (shouldHandleDoubleTap(context, navBarView, downX, downY)) {
                             lastLockTime = currentTime;
-                            XposedBridge.log(TAG + ": Double tap detected - locking screen");
-                            navBarView.postDelayed(() -> lockScreen(context), 150);
+                            log("Double tap detected - locking screen");
+                            navBarView.postDelayed(() -> lockScreen(context, navBarView), 150);
                         }
                     } else {
                         lastTapTime = now;
@@ -179,7 +188,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": Error checking excluded buttons: " + t.getMessage());
+            log("Error checking excluded buttons: " + t.getMessage());
         }
         return false;
     }
@@ -192,14 +201,14 @@ public class MainHook implements IXposedHookLoadPackage {
                 return context.getResources().getInteger(resId);
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": Error reading nav mode from resource: " + t.getMessage());
+            log("Error reading nav mode from resource: " + t.getMessage());
         }
 
         try {
             return android.provider.Settings.Secure.getInt(
                     context.getContentResolver(), "navigation_mode", NAV_MODE_3BUTTON);
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": Error reading nav mode from settings: " + t.getMessage());
+            log("Error reading nav mode from settings: " + t.getMessage());
         }
 
         return NAV_MODE_3BUTTON;
@@ -226,7 +235,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             }
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": Error checking hint bar visibility: " + t.getMessage());
+            log("Error checking hint bar visibility: " + t.getMessage());
         }
 
         return true;
@@ -248,10 +257,70 @@ public class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    private void lockScreen(Context context) {
-        if (tryGoToSleep(context)) return;
-        if (tryInjectSleepKey(context)) return;
-        tryShellSleepCommand();
+    private void lockScreen(Context context, View navBarView) {
+        // Primary: InputManager (framework input pipeline — most reliable across OEMs)
+        if (!tryInjectSleepKey(context)) {
+            // Fallback 1: PowerManager.goToSleep
+            if (!tryGoToSleep(context)) {
+                // Fallback 2: shell command (last resort)
+                tryShellSleepCommand();
+            }
+        }
+
+        // Deferred diagnostic check — does not affect control flow
+        navBarView.postDelayed(() -> {
+            try {
+                PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+                if (pm != null && pm.isInteractive()) {
+                    log("WARNING: Screen still interactive 200ms after lock attempt");
+                }
+            } catch (Throwable ignored) {}
+        }, 200);
+    }
+
+    private boolean tryInjectSleepKey(Context context) {
+        try {
+            log("Trying KEYCODE_SLEEP injection...");
+            Object inputManager = context.getSystemService(Context.INPUT_SERVICE);
+            if (inputManager == null) {
+                log("InputManager is null from getSystemService, trying getInstance...");
+                try {
+                    Method getInstance = Class.forName("android.hardware.input.InputManager")
+                            .getMethod("getInstance");
+                    inputManager = getInstance.invoke(null);
+                } catch (Throwable t2) {
+                    log("InputManager not available: " + t2.getMessage());
+                    return false;
+                }
+            }
+            if (inputManager == null) {
+                log("InputManager is null");
+                return false;
+            }
+
+            long now = SystemClock.uptimeMillis();
+            KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_SLEEP,
+                    0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0,
+                    KeyEvent.FLAG_FROM_SYSTEM, InputDevice.SOURCE_KEYBOARD);
+            KeyEvent up = KeyEvent.changeAction(down, KeyEvent.ACTION_UP);
+
+            Method injectMethod = inputManager.getClass().getMethod(
+                    "injectInputEvent", InputEvent.class, int.class);
+            injectMethod.invoke(inputManager, down, 0); // INJECT_INPUT_EVENT_MODE_ASYNC
+            injectMethod.invoke(inputManager, up, 0);
+
+            down.recycle();
+            up.recycle();
+
+            log("KEYCODE_SLEEP injection completed");
+            return true;
+        } catch (Throwable t) {
+            Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException && t.getCause() != null)
+                    ? t.getCause() : t;
+            log("KEYCODE_SLEEP injection failed: " + cause.getClass().getSimpleName()
+                    + ": " + cause.getMessage());
+            return false;
+        }
     }
 
     private boolean tryGoToSleep(Context context) {
@@ -259,66 +328,36 @@ public class MainHook implements IXposedHookLoadPackage {
             PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
             if (pm == null) return false;
 
-            XposedBridge.log(TAG + ": Trying goToSleep...");
+            log("Trying goToSleep...");
             try {
+                // 3-arg version: reason=4 (GO_TO_SLEEP_REASON_POWER_BUTTON), flags=0
                 Method goToSleep = PowerManager.class.getMethod(
                         "goToSleep", long.class, int.class, int.class);
-                goToSleep.invoke(pm, SystemClock.uptimeMillis(), 4, 0); // reason=4 (POWER_BUTTON)
+                goToSleep.invoke(pm, SystemClock.uptimeMillis(), 4, 0);
             } catch (NoSuchMethodException e) {
+                // Older API: single-arg version
                 Method goToSleep = PowerManager.class.getMethod("goToSleep", long.class);
                 goToSleep.invoke(pm, SystemClock.uptimeMillis());
             }
 
-            Thread.sleep(50);
-            if (!pm.isInteractive()) {
-                XposedBridge.log(TAG + ": goToSleep succeeded");
-                return true;
-            }
-            XposedBridge.log(TAG + ": goToSleep called but screen still on");
+            log("goToSleep call completed");
+            return true;
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": goToSleep failed: " + t.getMessage());
+            Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException && t.getCause() != null)
+                    ? t.getCause() : t;
+            log("goToSleep failed: " + cause.getClass().getSimpleName()
+                    + ": " + cause.getMessage());
+            return false;
         }
-        return false;
-    }
-
-    private boolean tryInjectSleepKey(Context context) {
-        try {
-            XposedBridge.log(TAG + ": Trying KEYCODE_SLEEP injection...");
-            Object inputManager = context.getSystemService(Context.INPUT_SERVICE);
-            if (inputManager == null) {
-                XposedBridge.log(TAG + ": InputManager is null");
-                return false;
-            }
-
-            long now = SystemClock.uptimeMillis();
-            KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_SLEEP, 0);
-            KeyEvent up = new KeyEvent(now, now, KeyEvent.ACTION_UP, KeyEvent.KEYCODE_SLEEP, 0);
-
-            Method injectMethod = inputManager.getClass().getMethod(
-                    "injectInputEvent", InputEvent.class, int.class);
-            injectMethod.invoke(inputManager, down, 0); // INJECT_INPUT_EVENT_MODE_ASYNC
-            injectMethod.invoke(inputManager, up, 0);
-
-            Thread.sleep(50);
-            PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
-            if (pm != null && !pm.isInteractive()) {
-                XposedBridge.log(TAG + ": KEYCODE_SLEEP injection succeeded");
-                return true;
-            }
-            XposedBridge.log(TAG + ": KEYCODE_SLEEP injected but screen still on");
-        } catch (Throwable t) {
-            XposedBridge.log(TAG + ": KEYCODE_SLEEP injection failed: " + t.getMessage());
-        }
-        return false;
     }
 
     private void tryShellSleepCommand() {
         try {
-            XposedBridge.log(TAG + ": Trying shell command...");
+            log("Trying shell command fallback...");
             Runtime.getRuntime().exec(new String[]{"input", "keyevent", "223"});
-            XposedBridge.log(TAG + ": Shell command sent");
+            log("Shell command dispatched");
         } catch (Throwable t) {
-            XposedBridge.log(TAG + ": Shell command failed: " + t.getMessage());
+            log("Shell command failed: " + t.getMessage());
         }
     }
 }
