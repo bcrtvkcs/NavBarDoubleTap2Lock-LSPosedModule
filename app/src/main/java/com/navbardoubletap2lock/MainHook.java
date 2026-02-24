@@ -25,9 +25,12 @@ public class MainHook implements IXposedHookLoadPackage {
     private static final long TAP_MAX_DURATION = 300;
     private static final float TAP_MAX_DISTANCE = 100f;
 
+    private static final long LOCK_COOLDOWN_MS = 500;
+
     private float downX, downY;
     private long downTime;
     private long lastTapTime;
+    private long lastLockTime;
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
@@ -112,8 +115,14 @@ public class MainHook implements IXposedHookLoadPackage {
                     if (lastTapTime > 0 && (now - lastTapTime) <= doubleTapTimeout) {
                         lastTapTime = 0;
 
+                        long currentTime = SystemClock.uptimeMillis();
+                        if (currentTime - lastLockTime < LOCK_COOLDOWN_MS) {
+                            break;
+                        }
+
                         Context context = navBarView.getContext();
                         if (shouldHandleDoubleTap(context, navBarView, downX, downY)) {
+                            lastLockTime = currentTime;
                             XposedBridge.log(TAG + ": Double tap detected - locking screen");
                             lockScreen(context);
                         }
