@@ -7,26 +7,6 @@
         android:allowBackup="false"
         android:supportsRtl="true">
 
-        <!-- Xposed Module Flag -->
-        <meta-data
-            android:name="xposedmodule"
-            android:value="true" />
-
-        <!-- Xposed Module Description -->
-        <meta-data
-            android:name="xposeddescription"
-            android:value="@string/module_description" />
-
-        <!-- Minimum Xposed API Version -->
-        <meta-data
-            android:name="xposedminversion"
-            android:value="82" />
-
-        <!-- LSPosed Scope -->
-        <meta-data
-            android:name="xposedscope"
-            android:resource="@array/xposed_scope" />
-
     </application>
 
 </manifest>

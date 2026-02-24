@@ -21,13 +21,13 @@ In gesture navigation, when the hint bar (the thin line at the bottom) is hidden
 
 - Android 10+ (API 29)
 - Root access (Magisk / KernelSU)
-- LSPosed or Xposed Framework
+- LSPosed or Xposed Framework (with modern libxposed API support)
 
 ## Installation
 
 ### 1. Build the Project
 
-Open the project in Android Studio and build. The required `XposedBridgeAPI-89.jar` is already included in `app/lib/`.
+Open the project in Android Studio and build. The required `libxposed-api-100.jar` (modern Xposed API) is already included in `app/lib/`.
 
 ```
 Build > Build Bundle(s) / APK(s) > Build APK(s)
@@ -48,16 +48,22 @@ Install the compiled APK on your device.
 
 ```
 app/src/main/
-├── assets/
-│   └── xposed_init                       # Module entry point
 ├── java/com/navbardoubletap2lock/
-│   └── MainHook.java                     # All hook and logic code
+│   └── MainHook.java                          # All hook and logic code
+├── resources/META-INF/xposed/
+│   ├── java_init.list                          # Module entry class
+│   ├── module.prop                             # API version and scope config
+│   └── scope.list                              # Target package (SystemUI)
 ├── res/values/
-│   └── strings.xml                       # Module name, description, scope
-└── AndroidManifest.xml                   # Xposed metadata
+│   └── strings.xml                             # Module name and description
+└── AndroidManifest.xml                         # App manifest
 ```
 
 ## Technical Details
+
+### API
+
+This module uses the modern [libxposed API](https://github.com/libxposed/api) (v100). The main class extends `XposedModule` and uses `SimpleHooker<Method>` for hooking, replacing the legacy `IXposedHookLoadPackage` / `XC_MethodHook` pattern.
 
 ### Double-Tap Detection
 
