@@ -112,7 +112,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         lastTapTime = 0;
 
                         Context context = navBarView.getContext();
-                        if (shouldHandleDoubleTap(context, navBarView)) {
+                        if (shouldHandleDoubleTap(context, navBarView, downX, downY)) {
                             XposedBridge.log(TAG + ": Double tap detected - locking screen");
                             lockScreen(context);
                         }
@@ -130,14 +130,46 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private boolean shouldHandleDoubleTap(Context context, View navBarView) {
+    private boolean shouldHandleDoubleTap(Context context, View navBarView, float tapX, float tapY) {
         int navMode = getNavigationMode(context);
 
         if (navMode == NAV_MODE_GESTURE) {
             return isHintBarVisible(navBarView);
         }
 
-        return true;
+        // 3-button / 2-button mode: ignore taps on back and recent_apps buttons
+        return !isTapOnExcludedButton(navBarView, tapX, tapY);
+    }
+
+    private boolean isTapOnExcludedButton(View navBarView, float tapX, float tapY) {
+        try {
+            Context context = navBarView.getContext();
+            String[] excludedIds = {"back", "recent_apps"};
+
+            int[] navLoc = new int[2];
+            navBarView.getLocationOnScreen(navLoc);
+            float screenX = navLoc[0] + tapX;
+            float screenY = navLoc[1] + tapY;
+
+            for (String id : excludedIds) {
+                int resId = context.getResources().getIdentifier(
+                        id, "id", "com.android.systemui");
+                if (resId != 0) {
+                    View button = navBarView.findViewById(resId);
+                    if (button != null && button.getVisibility() == View.VISIBLE) {
+                        int[] btnLoc = new int[2];
+                        button.getLocationOnScreen(btnLoc);
+                        if (screenX >= btnLoc[0] && screenX <= btnLoc[0] + button.getWidth()
+                                && screenY >= btnLoc[1] && screenY <= btnLoc[1] + button.getHeight()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            XposedBridge.log(TAG + ": Error checking excluded buttons: " + t.getMessage());
+        }
+        return false;
     }
 
     private int getNavigationMode(Context context) {
