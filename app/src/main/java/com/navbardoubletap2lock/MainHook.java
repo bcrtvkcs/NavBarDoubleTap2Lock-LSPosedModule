@@ -3,20 +3,19 @@ package com.navbardoubletap2lock;
 import android.content.Context;
 import android.os.PowerManager;
 import android.os.SystemClock;
-import android.util.Log;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
 import android.view.ViewGroup;
 
-import io.github.libxposed.api.XposedInterface;
-import io.github.libxposed.api.XposedModule;
-import io.github.libxposed.api.XposedModuleInterface;
-import io.github.libxposed.api.XposedModuleInterface.PackageLoadedParam;
+import de.robv.android.xposed.IXposedHookLoadPackage;
+import de.robv.android.xposed.XC_MethodHook;
+import de.robv.android.xposed.XposedBridge;
+import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
 import java.lang.reflect.Method;
 
-public class MainHook extends XposedModule {
+public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "NavBarDoubleTap2Lock";
 
@@ -26,17 +25,21 @@ public class MainHook extends XposedModule {
     private static final long TAP_MAX_DURATION = 300;
     private static final float TAP_MAX_DISTANCE = 100f;
 
+    private float downX, downY;
+    private long downTime;
+    private long lastTapTime;
+
     @Override
-    public void onPackageLoaded(PackageLoadedParam param) {
-        if (!"com.android.systemui".equals(param.getPackageName())) {
+    public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
+        if (!"com.android.systemui".equals(lpparam.packageName)) {
             return;
         }
 
-        log(Log.INFO, TAG, "Loaded in SystemUI", null);
+        XposedBridge.log(TAG + ": Loaded in SystemUI");
 
-        Class<?> navBarViewClass = findNavigationBarViewClass(param.getClassLoader());
+        Class<?> navBarViewClass = findNavigationBarViewClass(lpparam.classLoader);
         if (navBarViewClass == null) {
-            log(Log.ERROR, TAG, "NavigationBarView class not found, aborting", null);
+            XposedBridge.log(TAG + ": NavigationBarView class not found, aborting");
             return;
         }
 
@@ -52,7 +55,7 @@ public class MainHook extends XposedModule {
         for (String path : classPaths) {
             try {
                 Class<?> cls = Class.forName(path, false, classLoader);
-                log(Log.INFO, TAG, "Found NavigationBarView at " + path, null);
+                XposedBridge.log(TAG + ": Found NavigationBarView at " + path);
                 return cls;
             } catch (ClassNotFoundException ignored) {
             }
@@ -66,67 +69,64 @@ public class MainHook extends XposedModule {
             Method dispatchTouchEvent = navBarViewClass.getMethod(
                     "dispatchTouchEvent", MotionEvent.class);
 
-            hook(dispatchTouchEvent, new DispatchTouchHooker());
+            XposedBridge.hookMethod(dispatchTouchEvent, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        View navBarView = (View) param.thisObject;
+                        MotionEvent event = (MotionEvent) param.args[0];
+                        handleTouchForDoubleTap(navBarView, event);
+                    } catch (Throwable t) {
+                        XposedBridge.log(TAG + ": Error in hook callback: " + t.getMessage());
+                    }
+                }
+            });
 
-            log(Log.INFO, TAG, "dispatchTouchEvent hook installed on NavigationBarView", null);
+            XposedBridge.log(TAG + ": dispatchTouchEvent hook installed on NavigationBarView");
         } catch (NoSuchMethodException e) {
-            log(Log.ERROR, TAG, "dispatchTouchEvent method not found", e);
+            XposedBridge.log(TAG + ": dispatchTouchEvent method not found: " + e.getMessage());
         }
     }
 
-    private class DispatchTouchHooker implements XposedInterface.SimpleHooker<Method> {
+    private void handleTouchForDoubleTap(View navBarView, MotionEvent event) {
+        int action = event.getActionMasked();
 
-        private float downX, downY;
-        private long downTime;
-        private long lastTapTime;
+        switch (action) {
+            case MotionEvent.ACTION_DOWN:
+                downX = event.getX();
+                downY = event.getY();
+                downTime = event.getEventTime();
+                break;
 
-        @Override
-        public void after(XposedInterface.AfterHookCallback<Method> callback) {
-            View navBarView = (View) callback.getThisObject();
-            MotionEvent event = (MotionEvent) callback.getArgs()[0];
-            handleTouchForDoubleTap(navBarView, event);
-        }
+            case MotionEvent.ACTION_UP:
+                float dx = event.getX() - downX;
+                float dy = event.getY() - downY;
+                long duration = event.getEventTime() - downTime;
+                float distance = (float) Math.sqrt(dx * dx + dy * dy);
 
-        private void handleTouchForDoubleTap(View navBarView, MotionEvent event) {
-            int action = event.getActionMasked();
+                if (duration < TAP_MAX_DURATION && distance < TAP_MAX_DISTANCE) {
+                    long now = event.getEventTime();
+                    int doubleTapTimeout = ViewConfiguration.getDoubleTapTimeout();
 
-            switch (action) {
-                case MotionEvent.ACTION_DOWN:
-                    downX = event.getX();
-                    downY = event.getY();
-                    downTime = event.getEventTime();
-                    break;
+                    if (lastTapTime > 0 && (now - lastTapTime) <= doubleTapTimeout) {
+                        lastTapTime = 0;
 
-                case MotionEvent.ACTION_UP:
-                    float dx = event.getX() - downX;
-                    float dy = event.getY() - downY;
-                    long duration = event.getEventTime() - downTime;
-                    float distance = (float) Math.sqrt(dx * dx + dy * dy);
-
-                    if (duration < TAP_MAX_DURATION && distance < TAP_MAX_DISTANCE) {
-                        long now = event.getEventTime();
-                        int doubleTapTimeout = ViewConfiguration.getDoubleTapTimeout();
-
-                        if (lastTapTime > 0 && (now - lastTapTime) <= doubleTapTimeout) {
-                            lastTapTime = 0;
-
-                            Context context = navBarView.getContext();
-                            if (shouldHandleDoubleTap(context, navBarView)) {
-                                log(Log.INFO, TAG, "Double tap detected - locking screen", null);
-                                lockScreen(context);
-                            }
-                        } else {
-                            lastTapTime = now;
+                        Context context = navBarView.getContext();
+                        if (shouldHandleDoubleTap(context, navBarView)) {
+                            XposedBridge.log(TAG + ": Double tap detected - locking screen");
+                            lockScreen(context);
                         }
                     } else {
-                        lastTapTime = 0;
+                        lastTapTime = now;
                     }
-                    break;
-
-                case MotionEvent.ACTION_CANCEL:
+                } else {
                     lastTapTime = 0;
-                    break;
-            }
+                }
+                break;
+
+            case MotionEvent.ACTION_CANCEL:
+                lastTapTime = 0;
+                break;
         }
     }
 
@@ -148,14 +148,14 @@ public class MainHook extends XposedModule {
                 return context.getResources().getInteger(resId);
             }
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "Error reading nav mode from resource: " + t.getMessage(), t);
+            XposedBridge.log(TAG + ": Error reading nav mode from resource: " + t.getMessage());
         }
 
         try {
             return android.provider.Settings.Secure.getInt(
                     context.getContentResolver(), "navigation_mode", NAV_MODE_3BUTTON);
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "Error reading nav mode from settings: " + t.getMessage(), t);
+            XposedBridge.log(TAG + ": Error reading nav mode from settings: " + t.getMessage());
         }
 
         return NAV_MODE_3BUTTON;
@@ -182,7 +182,7 @@ public class MainHook extends XposedModule {
                 }
             }
         } catch (Throwable t) {
-            log(Log.WARN, TAG, "Error checking hint bar visibility: " + t.getMessage(), t);
+            XposedBridge.log(TAG + ": Error checking hint bar visibility: " + t.getMessage());
         }
 
         return true;
@@ -208,7 +208,7 @@ public class MainHook extends XposedModule {
         try {
             PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
             if (pm == null) {
-                log(Log.ERROR, TAG, "PowerManager is null", null);
+                XposedBridge.log(TAG + ": PowerManager is null");
                 return;
             }
 
@@ -221,7 +221,7 @@ public class MainHook extends XposedModule {
                 goToSleep.invoke(pm, SystemClock.uptimeMillis());
             }
         } catch (Throwable t) {
-            log(Log.ERROR, TAG, "Error locking screen: " + t.getMessage(), t);
+            XposedBridge.log(TAG + ": Error locking screen: " + t.getMessage());
         }
     }
 }
