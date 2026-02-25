@@ -142,10 +142,22 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
+    private volatile int debugTouchCount = 0;
+    private static final int DEBUG_MAX_LOG = 30;
+
     private void handleNavRegionTouch(View view, MotionEvent event) {
         initScreenMetrics(view);
 
         int action = event.getActionMasked();
+
+        // Debug: log first N touches to see what's reaching the hook
+        if (action == MotionEvent.ACTION_DOWN && debugTouchCount < DEBUG_MAX_LOG) {
+            debugTouchCount++;
+            log("DEBUG-TOUCH#" + debugTouchCount + ": DOWN rawY=" + event.getRawY()
+                    + " rawX=" + event.getRawX()
+                    + " threshold=" + navRegionThreshold
+                    + " inRegion=" + (event.getRawY() >= navRegionThreshold));
+        }
 
         switch (action) {
             case MotionEvent.ACTION_DOWN:
@@ -156,6 +168,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 downRawX = event.getRawX();
                 downRawY = event.getRawY();
                 downTime = event.getEventTime();
+                log("DEBUG: Nav region tap started at rawY=" + downRawY);
                 break;
 
             case MotionEvent.ACTION_MOVE:
@@ -176,6 +189,12 @@ public class MainHook implements IXposedHookLoadPackage {
                 float upDy = event.getRawY() - downRawY;
                 float dist = (float) Math.sqrt(upDx * upDx + upDy * upDy);
 
+                log("DEBUG: UP duration=" + duration + " dist=" + dist
+                        + " rawY=" + event.getRawY()
+                        + " qualifies=" + (duration <= TAP_MAX_DURATION
+                        && dist <= TAP_MAX_DISTANCE
+                        && event.getRawY() >= navRegionThreshold));
+
                 // UP must also be in nav region (rejects upward swipes)
                 if (duration <= TAP_MAX_DURATION
                         && dist <= TAP_MAX_DISTANCE
@@ -183,6 +202,10 @@ public class MainHook implements IXposedHookLoadPackage {
 
                     long now = event.getEventTime();
                     int doubleTapTimeout = ViewConfiguration.getDoubleTapTimeout();
+
+                    log("DEBUG: Tap qualified! lastTapTime=" + lastTapTime
+                            + " gap=" + (now - lastTapTime)
+                            + " doubleTapTimeout=" + doubleTapTimeout);
 
                     if (lastTapTime > 0 && (now - lastTapTime) <= doubleTapTimeout) {
                         lastTapTime = 0;
