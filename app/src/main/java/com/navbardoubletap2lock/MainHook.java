@@ -309,9 +309,6 @@ public class MainHook implements IXposedHookLoadPackage {
             injectMethod.invoke(inputManager, down, 0); // INJECT_INPUT_EVENT_MODE_ASYNC
             injectMethod.invoke(inputManager, up, 0);
 
-            down.recycle();
-            up.recycle();
-
             log("KEYCODE_SLEEP injection completed");
             return true;
         } catch (Throwable t) {
