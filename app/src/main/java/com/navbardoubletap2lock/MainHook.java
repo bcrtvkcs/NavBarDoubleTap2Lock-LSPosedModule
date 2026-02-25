@@ -19,6 +19,9 @@ import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
 import java.lang.reflect.Method;
+import java.util.Collections;
+import java.util.LinkedHashSet;
+import java.util.Set;
 
 public class MainHook implements IXposedHookLoadPackage {
 
@@ -32,6 +35,9 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final long LOCK_COOLDOWN_MS = 500;
 
+    // Diagnostic mode — set to false for production
+    private static final boolean DIAGNOSTIC_MODE = true;
+
     private static void log(String msg) {
         String fullMsg = TAG + ": " + msg;
         XposedBridge.log(fullMsg);
@@ -44,6 +50,12 @@ public class MainHook implements IXposedHookLoadPackage {
     private long lastLockTime;
     private volatile Class<?> navBarViewRuntimeClass = null;
 
+    // Diagnostic fields
+    private final Set<String> diagLoggedClasses =
+            Collections.synchronizedSet(new LinkedHashSet<>());
+    private volatile int diagScreenHeight = -1;
+    private volatile int diagNavBarHeight = -1;
+
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
         if (!"com.android.systemui".equals(lpparam.packageName)) {
@@ -52,22 +64,29 @@ public class MainHook implements IXposedHookLoadPackage {
 
         log("Loaded in SystemUI");
 
-        // Diagnostic: log AOSP class path
+        // 1. NavigationBarView diagnostic — constructor hook to verify instantiation
         Class<?> navBarViewClass = findNavigationBarViewClass(lpparam.classLoader);
-
-        // Diagnostic: if class found, hook constructors to verify instantiation
         if (navBarViewClass != null) {
             XposedBridge.hookAllConstructors(navBarViewClass, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
-                    log("AOSP NavigationBarView constructed, runtime class: "
+                    log("NavigationBarView constructed: "
                             + param.thisObject.getClass().getName());
+                    navBarViewRuntimeClass = param.thisObject.getClass();
                 }
             });
         }
 
-        // Main hook — install regardless of whether AOSP class was found
-        hookNavigationBarTouch();
+        // 2. NavigationBarFrame — primary hook target for Android 16+
+        boolean frameHooked = hookNavigationBarFrame(lpparam.classLoader);
+        if (frameHooked) {
+            log("Using NavigationBarFrame as primary hook target");
+        }
+
+        // 3. Fallback: ViewGroup blanket hook (diagnostic + backup)
+        if (!frameHooked || DIAGNOSTIC_MODE) {
+            hookNavigationBarTouch();
+        }
     }
 
     private Class<?> findNavigationBarViewClass(ClassLoader classLoader) {
@@ -89,6 +108,57 @@ public class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
+    private boolean hookNavigationBarFrame(ClassLoader classLoader) {
+        String[] framePaths = {
+                "com.android.systemui.navigationbar.views.NavigationBarFrame", // Android 16+
+                "com.android.systemui.navigationbar.NavigationBarFrame",       // Android 12L-15
+                "com.android.systemui.statusbar.phone.NavigationBarFrame"      // older
+        };
+
+        for (String path : framePaths) {
+            try {
+                Class<?> frameClass = Class.forName(path, false, classLoader);
+                log("Found NavigationBarFrame at " + path);
+
+                try {
+                    // getDeclaredMethod: only finds methods declared in THIS class
+                    // If NavigationBarFrame overrides dispatchTouchEvent, this hook
+                    // fires ONLY for NavigationBarFrame instances — not all ViewGroups
+                    Method declared = frameClass.getDeclaredMethod(
+                            "dispatchTouchEvent", MotionEvent.class);
+
+                    XposedBridge.hookMethod(declared, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                View navFrame = (View) param.thisObject;
+                                MotionEvent event = (MotionEvent) param.args[0];
+                                handleTouchForDoubleTap(navFrame, event);
+                            } catch (Throwable t) {
+                                log("Error in NavigationBarFrame hook: " + t.getMessage());
+                            }
+                        }
+                    });
+
+                    log("Hooked NavigationBarFrame.dispatchTouchEvent (declared)");
+                    navBarViewRuntimeClass = frameClass;
+                    return true;
+
+                } catch (NoSuchMethodException e) {
+                    // NavigationBarFrame doesn't override dispatchTouchEvent
+                    // Set the class so ViewGroup fallback hook can match by identity
+                    log("NavigationBarFrame found but no dispatchTouchEvent override");
+                    navBarViewRuntimeClass = frameClass;
+                    return true;
+                }
+
+            } catch (ClassNotFoundException ignored) {
+            }
+        }
+
+        return false;
+    }
+
     private void hookNavigationBarTouch() {
         try {
             Method dispatchTouchEvent = ViewGroup.class.getMethod(
@@ -98,21 +168,28 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     try {
-                        // Fast path: cached class reference (O(1) reference equality)
+                        ViewGroup vg = (ViewGroup) param.thisObject;
+                        MotionEvent event = (MotionEvent) param.args[0];
+
+                        // Diagnostic: log ViewGroups in the nav bar screen region
+                        if (DIAGNOSTIC_MODE
+                                && event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                            diagCheckView(vg, event);
+                        }
+
+                        // Production filter
                         if (navBarViewRuntimeClass != null) {
-                            if (param.thisObject.getClass() != navBarViewRuntimeClass) return;
+                            if (vg.getClass() != navBarViewRuntimeClass) return;
                         } else {
-                            // First-time detection: match by class name suffix
-                            if (!param.thisObject.getClass().getSimpleName()
-                                    .endsWith("NavigationBarView")) return;
-                            navBarViewRuntimeClass = param.thisObject.getClass();
-                            log("Detected runtime NavigationBarView: "
+                            String name = vg.getClass().getSimpleName();
+                            if (!name.endsWith("NavigationBarView")
+                                    && !name.equals("NavigationBarFrame")) return;
+                            navBarViewRuntimeClass = vg.getClass();
+                            log("Detected nav bar class: "
                                     + navBarViewRuntimeClass.getName());
                         }
 
-                        View navBarView = (View) param.thisObject;
-                        MotionEvent event = (MotionEvent) param.args[0];
-                        handleTouchForDoubleTap(navBarView, event);
+                        handleTouchForDoubleTap((View) vg, event);
                     } catch (Throwable t) {
                         log("Error in hook callback: " + t.getMessage());
                     }
@@ -124,6 +201,60 @@ public class MainHook implements IXposedHookLoadPackage {
             log("dispatchTouchEvent method not found: " + e.getMessage());
         }
     }
+
+    // --- Diagnostic methods ---
+
+    private void initDiagScreenMetrics(View view) {
+        if (diagScreenHeight > 0) return;
+        try {
+            Context ctx = view.getContext();
+            android.util.DisplayMetrics dm = ctx.getResources().getDisplayMetrics();
+            diagScreenHeight = dm.heightPixels;
+            int resId = ctx.getResources().getIdentifier(
+                    "navigation_bar_height", "dimen", "android");
+            diagNavBarHeight = (resId != 0)
+                    ? ctx.getResources().getDimensionPixelSize(resId)
+                    : (int) (48 * dm.density);
+            log("DIAG: screenH=" + diagScreenHeight + " navBarH=" + diagNavBarHeight);
+        } catch (Throwable t) {
+            diagScreenHeight = 2400;
+            diagNavBarHeight = 126;
+        }
+    }
+
+    private void diagCheckView(ViewGroup vg, MotionEvent event) {
+        if (diagLoggedClasses.size() >= 50) return;
+        initDiagScreenMetrics(vg);
+        try {
+            int[] loc = new int[2];
+            vg.getLocationOnScreen(loc);
+            int viewBottom = loc[1] + vg.getHeight();
+            int navRegionTop = diagScreenHeight - diagNavBarHeight - 20;
+
+            // Is this view in the nav bar region of the screen?
+            if (viewBottom >= diagScreenHeight - 5 && loc[1] >= navRegionTop) {
+                String cls = vg.getClass().getName();
+                if (diagLoggedClasses.add(cls)) {
+                    log("DIAG-NAV: " + cls
+                            + " pos=[" + loc[0] + "," + loc[1] + "]"
+                            + " size=" + vg.getWidth() + "x" + vg.getHeight()
+                            + " children=" + vg.getChildCount());
+
+                    // Log parent chain (up to 8 levels)
+                    StringBuilder sb = new StringBuilder("DIAG-PARENTS: " + cls);
+                    android.view.ViewParent p = vg.getParent();
+                    for (int i = 0; i < 8 && p instanceof View; i++) {
+                        sb.append(" <- ").append(p.getClass().getName());
+                        p = ((View) p).getParent();
+                    }
+                    log(sb.toString());
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    // --- Double-tap detection ---
 
     private void handleTouchForDoubleTap(View navBarView, MotionEvent event) {
         int action = event.getActionMasked();
@@ -278,6 +409,8 @@ public class MainHook implements IXposedHookLoadPackage {
         }
         return null;
     }
+
+    // --- Screen lock methods ---
 
     private void lockScreen(Context context, View navBarView) {
         // Primary: InputManager (framework input pipeline — most reliable across OEMs)
