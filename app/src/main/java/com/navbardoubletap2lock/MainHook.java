@@ -6,7 +6,7 @@ import android.os.SystemClock;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.InputEvent;
-import android.view.InputEventReceiver;
+
 import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -433,7 +433,9 @@ public class MainHook implements IXposedHookLoadPackage {
         final int[] diagInputCount = {0};
 
         try {
-            Method onInputEvent = InputEventReceiver.class.getDeclaredMethod(
+            // Hidden API — use reflection instead of direct import
+            Class<?> receiverClass = Class.forName("android.view.InputEventReceiver");
+            Method onInputEvent = receiverClass.getDeclaredMethod(
                     "onInputEvent", InputEvent.class);
 
             XposedBridge.hookMethod(onInputEvent, new XC_MethodHook() {
