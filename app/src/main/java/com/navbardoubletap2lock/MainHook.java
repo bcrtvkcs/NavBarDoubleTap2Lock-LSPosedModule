@@ -42,6 +42,7 @@ public class MainHook implements IXposedHookLoadPackage {
     private long downTime;
     private long lastTapTime;
     private long lastLockTime;
+    private volatile Class<?> navBarViewRuntimeClass = null;
 
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
@@ -51,13 +52,22 @@ public class MainHook implements IXposedHookLoadPackage {
 
         log("Loaded in SystemUI");
 
+        // Diagnostic: log AOSP class path
         Class<?> navBarViewClass = findNavigationBarViewClass(lpparam.classLoader);
-        if (navBarViewClass == null) {
-            log("NavigationBarView class not found, aborting");
-            return;
+
+        // Diagnostic: if class found, hook constructors to verify instantiation
+        if (navBarViewClass != null) {
+            XposedBridge.hookAllConstructors(navBarViewClass, new XC_MethodHook() {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    log("AOSP NavigationBarView constructed, runtime class: "
+                            + param.thisObject.getClass().getName());
+                }
+            });
         }
 
-        hookNavigationBarTouch(navBarViewClass);
+        // Main hook — install regardless of whether AOSP class was found
+        hookNavigationBarTouch();
     }
 
     private Class<?> findNavigationBarViewClass(ClassLoader classLoader) {
@@ -79,19 +89,26 @@ public class MainHook implements IXposedHookLoadPackage {
         return null;
     }
 
-    private void hookNavigationBarTouch(Class<?> navBarViewClass) {
+    private void hookNavigationBarTouch() {
         try {
-            Method dispatchTouchEvent = navBarViewClass.getMethod(
+            Method dispatchTouchEvent = ViewGroup.class.getMethod(
                     "dispatchTouchEvent", MotionEvent.class);
 
             XposedBridge.hookMethod(dispatchTouchEvent, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     try {
-                        // dispatchTouchEvent is inherited from ViewGroup, so
-                        // this hook fires for ALL ViewGroups in SystemUI.
-                        // Only process events for actual NavigationBarView instances.
-                        if (!navBarViewClass.isInstance(param.thisObject)) return;
+                        // Fast path: cached class reference (O(1) reference equality)
+                        if (navBarViewRuntimeClass != null) {
+                            if (param.thisObject.getClass() != navBarViewRuntimeClass) return;
+                        } else {
+                            // First-time detection: match by class name suffix
+                            if (!param.thisObject.getClass().getSimpleName()
+                                    .endsWith("NavigationBarView")) return;
+                            navBarViewRuntimeClass = param.thisObject.getClass();
+                            log("Detected runtime NavigationBarView: "
+                                    + navBarViewRuntimeClass.getName());
+                        }
 
                         View navBarView = (View) param.thisObject;
                         MotionEvent event = (MotionEvent) param.args[0];
@@ -102,7 +119,7 @@ public class MainHook implements IXposedHookLoadPackage {
                 }
             });
 
-            log("dispatchTouchEvent hook installed on NavigationBarView");
+            log("dispatchTouchEvent hook installed");
         } catch (NoSuchMethodException e) {
             log("dispatchTouchEvent method not found: " + e.getMessage());
         }
