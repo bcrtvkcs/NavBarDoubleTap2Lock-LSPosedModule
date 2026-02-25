@@ -88,6 +88,11 @@ public class MainHook implements IXposedHookLoadPackage {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
                     try {
+                        // dispatchTouchEvent is inherited from ViewGroup, so
+                        // this hook fires for ALL ViewGroups in SystemUI.
+                        // Only process events for actual NavigationBarView instances.
+                        if (!navBarViewClass.isInstance(param.thisObject)) return;
+
                         View navBarView = (View) param.thisObject;
                         MotionEvent event = (MotionEvent) param.args[0];
                         handleTouchForDoubleTap(navBarView, event);
