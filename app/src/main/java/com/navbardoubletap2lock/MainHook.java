@@ -6,6 +6,7 @@ import android.os.SystemClock;
 import android.util.Log;
 import android.view.InputDevice;
 import android.view.InputEvent;
+import android.view.InputEventReceiver;
 import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
@@ -56,6 +57,15 @@ public class MainHook implements IXposedHookLoadPackage {
     private volatile int diagScreenHeight = -1;
     private volatile int diagNavBarHeight = -1;
 
+    // Diagnostic counters (new — comprehensive diagnostics)
+    private volatile int diagTapCount = 0;
+    private static final int DIAG_MAX_TAP_LOG = 20;
+    private static final int DIAG_MAX_CLASS_LOG = 30;
+    private volatile boolean diagFrameConstructed = false;
+    private volatile boolean diagNavBarViewConstructed = false;
+    private final Set<String> diagAllDownClasses =
+            Collections.synchronizedSet(new LinkedHashSet<>());
+
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
         if (!"com.android.systemui".equals(lpparam.packageName)) {
@@ -70,9 +80,24 @@ public class MainHook implements IXposedHookLoadPackage {
             XposedBridge.hookAllConstructors(navBarViewClass, new XC_MethodHook() {
                 @Override
                 protected void afterHookedMethod(MethodHookParam param) {
-                    log("NavigationBarView constructed: "
+                    diagNavBarViewConstructed = true;
+                    log("DIAG-CTOR: NavigationBarView CONSTRUCTED: "
                             + param.thisObject.getClass().getName());
                     navBarViewRuntimeClass = param.thisObject.getClass();
+                    if (param.thisObject instanceof View) {
+                        View v = (View) param.thisObject;
+                        v.post(() -> {
+                            try {
+                                int[] loc = new int[2];
+                                v.getLocationOnScreen(loc);
+                                log("DIAG-CTOR-LAYOUT: NavigationBarView pos=["
+                                        + loc[0] + "," + loc[1] + "] size="
+                                        + v.getWidth() + "x" + v.getHeight());
+                            } catch (Throwable t) {
+                                log("DIAG-CTOR-LAYOUT: error " + t.getMessage());
+                            }
+                        });
+                    }
                 }
             });
         }
@@ -86,6 +111,23 @@ public class MainHook implements IXposedHookLoadPackage {
         // 3. Fallback: ViewGroup blanket hook (diagnostic + backup)
         if (!frameHooked || DIAGNOSTIC_MODE) {
             hookNavigationBarTouch();
+        }
+
+        // 4. Diagnostic-only hooks — comprehensive 5-layer touch tracing
+        if (DIAGNOSTIC_MODE) {
+            hookAlternativeTouchMethods();
+            hookWindowLevelTouch(lpparam.classLoader);
+            hookInputEventReceiver();
+
+            // Delayed summary report after 10 seconds
+            new android.os.Handler(android.os.Looper.getMainLooper()).postDelayed(() -> {
+                log("DIAG-SUMMARY: NavigationBarFrame constructed=" + diagFrameConstructed);
+                log("DIAG-SUMMARY: NavigationBarView constructed=" + diagNavBarViewConstructed);
+                log("DIAG-SUMMARY: Unique dispatch classes seen=" + diagAllDownClasses.size());
+                log("DIAG-SUMMARY: Total taps logged=" + diagTapCount);
+                log("DIAG-SUMMARY: screenH=" + diagScreenHeight
+                        + " navBarH=" + diagNavBarHeight);
+            }, 10000);
         }
     }
 
@@ -119,6 +161,34 @@ public class MainHook implements IXposedHookLoadPackage {
             try {
                 Class<?> frameClass = Class.forName(path, false, classLoader);
                 log("Found NavigationBarFrame at " + path);
+
+                // DIAGNOSTIC: Hook all constructors to confirm/deny instantiation
+                if (DIAGNOSTIC_MODE) {
+                    XposedBridge.hookAllConstructors(frameClass, new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            diagFrameConstructed = true;
+                            View v = (View) param.thisObject;
+                            log("DIAG-CTOR: NavigationBarFrame CONSTRUCTED! class="
+                                    + param.thisObject.getClass().getName()
+                                    + " id=" + Integer.toHexString(v.getId()));
+                            v.post(() -> {
+                                try {
+                                    int[] loc = new int[2];
+                                    v.getLocationOnScreen(loc);
+                                    log("DIAG-CTOR-LAYOUT: NavigationBarFrame pos=["
+                                            + loc[0] + "," + loc[1] + "] size="
+                                            + v.getWidth() + "x" + v.getHeight()
+                                            + " visibility=" + v.getVisibility()
+                                            + " attached=" + v.isAttachedToWindow());
+                                } catch (Throwable t) {
+                                    log("DIAG-CTOR-LAYOUT: error " + t.getMessage());
+                                }
+                            });
+                        }
+                    });
+                    log("DIAG: Hooked NavigationBarFrame constructors");
+                }
 
                 try {
                     // getDeclaredMethod: only finds methods declared in THIS class
@@ -202,7 +272,198 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    // --- Diagnostic methods ---
+    // --- Diagnostic hook methods (comprehensive — 5-layer) ---
+
+    private void hookAlternativeTouchMethods() {
+        final Set<String> diagOnTouchClasses =
+                Collections.synchronizedSet(new LinkedHashSet<>());
+        final Set<String> diagInterceptClasses =
+                Collections.synchronizedSet(new LinkedHashSet<>());
+
+        // Hook View.onTouchEvent
+        try {
+            Method onTouchEvent = View.class.getMethod("onTouchEvent", MotionEvent.class);
+            XposedBridge.hookMethod(onTouchEvent, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!DIAGNOSTIC_MODE) return;
+                    View v = (View) param.thisObject;
+                    MotionEvent event = (MotionEvent) param.args[0];
+                    if (event.getActionMasked() != MotionEvent.ACTION_DOWN) return;
+                    if (diagOnTouchClasses.size() >= 30) return;
+
+                    float rawY = event.getRawY();
+                    if (rawY >= diagScreenHeight - 200) {
+                        String cls = v.getClass().getName();
+                        if (diagOnTouchClasses.add(cls)) {
+                            int[] loc = new int[2];
+                            try { v.getLocationOnScreen(loc); } catch (Throwable ignored) {}
+                            log("DIAG-ONTOUCH: " + cls
+                                    + " rawY=" + rawY
+                                    + " pos=[" + loc[0] + "," + loc[1] + "]"
+                                    + " size=" + v.getWidth() + "x" + v.getHeight());
+                        }
+                    }
+                }
+            });
+            log("DIAG: Hooked View.onTouchEvent");
+        } catch (Throwable t) {
+            log("DIAG: Failed to hook View.onTouchEvent: " + t.getMessage());
+        }
+
+        // Hook ViewGroup.onInterceptTouchEvent
+        try {
+            Method onInterceptTouchEvent = ViewGroup.class.getMethod(
+                    "onInterceptTouchEvent", MotionEvent.class);
+            XposedBridge.hookMethod(onInterceptTouchEvent, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!DIAGNOSTIC_MODE) return;
+                    ViewGroup vg = (ViewGroup) param.thisObject;
+                    MotionEvent event = (MotionEvent) param.args[0];
+                    if (event.getActionMasked() != MotionEvent.ACTION_DOWN) return;
+                    if (diagInterceptClasses.size() >= 30) return;
+
+                    float rawY = event.getRawY();
+                    if (rawY >= diagScreenHeight - 200) {
+                        String cls = vg.getClass().getName();
+                        if (diagInterceptClasses.add(cls)) {
+                            int[] loc = new int[2];
+                            try { vg.getLocationOnScreen(loc); } catch (Throwable ignored) {}
+                            log("DIAG-INTERCEPT: " + cls
+                                    + " rawY=" + rawY
+                                    + " pos=[" + loc[0] + "," + loc[1] + "]"
+                                    + " size=" + vg.getWidth() + "x" + vg.getHeight());
+                        }
+                    }
+                }
+            });
+            log("DIAG: Hooked ViewGroup.onInterceptTouchEvent");
+        } catch (Throwable t) {
+            log("DIAG: Failed to hook ViewGroup.onInterceptTouchEvent: " + t.getMessage());
+        }
+    }
+
+    private void hookWindowLevelTouch(ClassLoader classLoader) {
+        final Set<String> diagWindowClasses =
+                Collections.synchronizedSet(new LinkedHashSet<>());
+        final int[] diagWindowTapCount = {0};
+
+        // Hook DecorView.dispatchTouchEvent — entry point for ALL touch events in every window
+        try {
+            Class<?> decorViewClass = Class.forName(
+                    "com.android.internal.policy.DecorView", false, classLoader);
+            Method dispatchTouch = decorViewClass.getMethod(
+                    "dispatchTouchEvent", MotionEvent.class);
+
+            XposedBridge.hookMethod(dispatchTouch, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!DIAGNOSTIC_MODE) return;
+                    MotionEvent event = (MotionEvent) param.args[0];
+                    if (event.getActionMasked() != MotionEvent.ACTION_DOWN) return;
+
+                    View decorView = (View) param.thisObject;
+                    float rawY = event.getRawY();
+
+                    if (rawY >= diagScreenHeight - 300 && diagWindowTapCount[0] < 30) {
+                        diagWindowTapCount[0]++;
+                        int[] loc = new int[2];
+                        try { decorView.getLocationOnScreen(loc); } catch (Throwable ignored) {}
+
+                        String windowInfo = "unknown";
+                        try {
+                            android.view.WindowManager.LayoutParams lp =
+                                    (android.view.WindowManager.LayoutParams)
+                                    decorView.getLayoutParams();
+                            if (lp != null) {
+                                windowInfo = "type=" + lp.type
+                                        + " title=" + lp.getTitle()
+                                        + " flags=0x" + Integer.toHexString(lp.flags);
+                            }
+                        } catch (Throwable ignored) {}
+
+                        log("DIAG-WINDOW#" + diagWindowTapCount[0]
+                                + ": rawX=" + event.getRawX()
+                                + " rawY=" + rawY
+                                + " decorView=" + decorView.getClass().getName()
+                                + " pos=[" + loc[0] + "," + loc[1] + "]"
+                                + " size=" + decorView.getWidth() + "x" + decorView.getHeight()
+                                + " " + windowInfo);
+                    }
+                }
+            });
+            log("DIAG: Hooked DecorView.dispatchTouchEvent");
+        } catch (Throwable t) {
+            log("DIAG: Failed to hook DecorView: " + t.getMessage());
+        }
+
+        // Hook PhoneWindow.superDispatchTouchEvent
+        try {
+            Class<?> phoneWindowClass = Class.forName(
+                    "com.android.internal.policy.PhoneWindow", false, classLoader);
+            Method superDispatch = phoneWindowClass.getMethod(
+                    "superDispatchTouchEvent", MotionEvent.class);
+
+            XposedBridge.hookMethod(superDispatch, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!DIAGNOSTIC_MODE) return;
+                    MotionEvent event = (MotionEvent) param.args[0];
+                    if (event.getActionMasked() != MotionEvent.ACTION_DOWN) return;
+
+                    float rawY = event.getRawY();
+                    if (rawY >= diagScreenHeight - 300) {
+                        String windowClass = param.thisObject.getClass().getName();
+                        if (diagWindowClasses.add(windowClass + "@rawY=" + (int) rawY)) {
+                            log("DIAG-PHONEWINDOW: " + windowClass
+                                    + " rawY=" + rawY
+                                    + " rawX=" + event.getRawX());
+                        }
+                    }
+                }
+            });
+            log("DIAG: Hooked PhoneWindow.superDispatchTouchEvent");
+        } catch (Throwable t) {
+            log("DIAG: Failed to hook PhoneWindow: " + t.getMessage());
+        }
+    }
+
+    private void hookInputEventReceiver() {
+        final int[] diagInputCount = {0};
+
+        try {
+            Method onInputEvent = InputEventReceiver.class.getDeclaredMethod(
+                    "onInputEvent", InputEvent.class);
+
+            XposedBridge.hookMethod(onInputEvent, new XC_MethodHook() {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    if (!DIAGNOSTIC_MODE) return;
+                    InputEvent inputEvent = (InputEvent) param.args[0];
+                    if (!(inputEvent instanceof MotionEvent)) return;
+
+                    MotionEvent event = (MotionEvent) inputEvent;
+                    if (event.getActionMasked() != MotionEvent.ACTION_DOWN) return;
+
+                    float rawY = event.getRawY();
+                    if (rawY >= diagScreenHeight - 300 && diagInputCount[0] < 20) {
+                        diagInputCount[0]++;
+                        log("DIAG-INPUT-RECV#" + diagInputCount[0]
+                                + ": rawX=" + event.getRawX()
+                                + " rawY=" + rawY
+                                + " receiver=" + param.thisObject.getClass().getName()
+                                + " source=0x" + Integer.toHexString(event.getSource()));
+                    }
+                }
+            });
+            log("DIAG: Hooked InputEventReceiver.onInputEvent");
+        } catch (Throwable t) {
+            log("DIAG: Failed to hook InputEventReceiver: " + t.getMessage());
+        }
+    }
+
+    // --- Diagnostic helper methods ---
 
     private void initDiagScreenMetrics(View view) {
         if (diagScreenHeight > 0) return;
@@ -223,34 +484,45 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     private void diagCheckView(ViewGroup vg, MotionEvent event) {
-        if (diagLoggedClasses.size() >= 50) return;
-        initDiagScreenMetrics(vg);
-        try {
+        // Log raw coordinates for first N taps (NO position filter)
+        if (diagTapCount < DIAG_MAX_TAP_LOG) {
+            diagTapCount++;
+            initDiagScreenMetrics(vg);
             int[] loc = new int[2];
-            vg.getLocationOnScreen(loc);
-            int viewBottom = loc[1] + vg.getHeight();
-            int navRegionTop = diagScreenHeight - diagNavBarHeight - 20;
+            try {
+                vg.getLocationOnScreen(loc);
+            } catch (Throwable ignored) {}
+            log("DIAG-TAP#" + diagTapCount + ": rawX=" + event.getRawX()
+                    + " rawY=" + event.getRawY()
+                    + " class=" + vg.getClass().getName()
+                    + " pos=[" + loc[0] + "," + loc[1] + "]"
+                    + " size=" + vg.getWidth() + "x" + vg.getHeight());
+        }
 
-            // Is this view in the nav bar region of the screen?
-            if (viewBottom >= diagScreenHeight - 5 && loc[1] >= navRegionTop) {
-                String cls = vg.getClass().getName();
-                if (diagLoggedClasses.add(cls)) {
-                    log("DIAG-NAV: " + cls
-                            + " pos=[" + loc[0] + "," + loc[1] + "]"
-                            + " size=" + vg.getWidth() + "x" + vg.getHeight()
-                            + " children=" + vg.getChildCount());
+        // Log unique classes (unfiltered) up to cap
+        if (diagAllDownClasses.size() < DIAG_MAX_CLASS_LOG) {
+            String cls = vg.getClass().getName();
+            if (diagAllDownClasses.add(cls)) {
+                initDiagScreenMetrics(vg);
+                int[] loc = new int[2];
+                try {
+                    vg.getLocationOnScreen(loc);
+                } catch (Throwable ignored) {}
+                log("DIAG-CLASS#" + diagAllDownClasses.size() + ": " + cls
+                        + " pos=[" + loc[0] + "," + loc[1] + "]"
+                        + " size=" + vg.getWidth() + "x" + vg.getHeight()
+                        + " children=" + vg.getChildCount());
 
-                    // Log parent chain (up to 8 levels)
-                    StringBuilder sb = new StringBuilder("DIAG-PARENTS: " + cls);
-                    android.view.ViewParent p = vg.getParent();
-                    for (int i = 0; i < 8 && p instanceof View; i++) {
-                        sb.append(" <- ").append(p.getClass().getName());
-                        p = ((View) p).getParent();
-                    }
-                    log(sb.toString());
+                // Parent chain
+                StringBuilder sb = new StringBuilder("  PARENTS: ");
+                android.view.ViewParent p = vg.getParent();
+                for (int i = 0; i < 8 && p instanceof View; i++) {
+                    if (i > 0) sb.append(" <- ");
+                    sb.append(p.getClass().getName());
+                    p = ((View) p).getParent();
                 }
+                log(sb.toString());
             }
-        } catch (Throwable ignored) {
         }
     }
 
