@@ -11,20 +11,19 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
+import android.view.ViewGroup;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
 import de.robv.android.xposed.callbacks.XC_LoadPackage.LoadPackageParam;
 
+import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 
 public class MainHook implements IXposedHookLoadPackage {
 
     private static final String TAG = "NavBarDoubleTap2Lock";
-
-    private static final int NAV_MODE_3BUTTON = 0;
-    private static final int NAV_MODE_GESTURE = 2;
 
     private static final long TAP_MAX_DURATION = 300;
     private static final float TAP_MAX_DISTANCE = 100f;
@@ -40,9 +39,6 @@ public class MainHook implements IXposedHookLoadPackage {
     // Shared lock cooldown timestamp
     private long lastLockTime;
 
-    // Track which process we're running in (affects lock strategy)
-    private boolean isSystemUiProcess;
-
     // Touch state for gesture nav (TaskbarDragLayer hook — view-local coords)
     private float taskbarDownX, taskbarDownY;
     private long taskbarDownTime;
@@ -57,16 +53,12 @@ public class MainHook implements IXposedHookLoadPackage {
     public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
         if ("com.android.systemui".equals(lpparam.packageName)) {
             log("Loaded in SystemUI");
-            isSystemUiProcess = true;
-            // 3-button nav: NavigationBarFrame hook
             hookNavigationBarFrame(lpparam.classLoader);
             return;
         }
 
         if ("com.android.launcher3".equals(lpparam.packageName)) {
             log("Loaded in Launcher3");
-            isSystemUiProcess = false;
-            // Gesture nav: TaskbarDragLayer hook
             hookTaskbarDragLayer(lpparam.classLoader);
             return;
         }
@@ -92,7 +84,6 @@ public class MainHook implements IXposedHookLoadPackage {
                         View view = (View) param.thisObject;
                         MotionEvent event = (MotionEvent) param.args[0];
                         handleTaskbarTouch(view, event);
-                        // IMPORTANT: never consume — let normal gesture nav work
                     } catch (Throwable t) {
                         log("Error in TaskbarDragLayer hook: " + t.getMessage());
                     }
@@ -235,12 +226,15 @@ public class MainHook implements IXposedHookLoadPackage {
                             break;
                         }
 
-                        Context context = navBarView.getContext();
-                        if (shouldHandleDoubleTap(context, navBarView, frameDownX, frameDownY)) {
-                            lastLockTime = currentTime;
-                            log("Double tap detected on NavigationBarFrame — locking screen");
-                            lockScreen(context, navBarView);
+                        // Exclude taps on back/recent buttons — only allow home button area
+                        if (isTapOnNonHomeButton(navBarView, frameDownX, frameDownY)) {
+                            log("Double tap excluded — tap is on back/recent button");
+                            break;
                         }
+
+                        lastLockTime = currentTime;
+                        log("Double tap detected on NavigationBarFrame — locking screen");
+                        lockScreen(navBarView.getContext(), navBarView);
                     } else {
                         frameLastTapTime = now;
                     }
@@ -255,81 +249,115 @@ public class MainHook implements IXposedHookLoadPackage {
         }
     }
 
-    private boolean shouldHandleDoubleTap(Context context, View navBarView, float tapX, float tapY) {
-        int navMode = getNavigationMode(context);
+    // =========================================================================
+    // 3-button nav: exclude taps on Back/Recent buttons via KeyButtonView.mCode
+    // =========================================================================
 
-        if (navMode == NAV_MODE_GESTURE) {
-            return true;
+    /**
+     * Walk the view hierarchy under navBarView, find KeyButtonView descendants,
+     * and check if the tap landed on one whose mCode != KEYCODE_HOME.
+     * Returns true if tap is on a non-home KeyButtonView (back, recent, etc.).
+     */
+    private boolean isTapOnNonHomeButton(View navBarView, float tapX, float tapY) {
+        try {
+            int[] navLoc = new int[2];
+            navBarView.getLocationOnScreen(navLoc);
+            float screenX = navLoc[0] + tapX;
+            float screenY = navLoc[1] + tapY;
+
+            return findNonHomeKeyButton(navBarView, screenX, screenY);
+        } catch (Throwable t) {
+            log("Error in button exclusion: " + t.getMessage());
         }
-
-        // 3-button mode: only allow taps in the center region (home button area).
-        // Layout is [Back | Home | Recent] — home button occupies roughly the center third.
-        // This is more reliable than resource ID lookup which varies across ROMs.
-        int viewWidth = navBarView.getWidth();
-        if (viewWidth > 0) {
-            float tapFraction = tapX / viewWidth;
-            if (tapFraction < 0.25f || tapFraction > 0.75f) {
-                log("Tap excluded: position " + String.format("%.0f", tapX)
-                        + "/" + viewWidth + " (fraction=" + String.format("%.2f", tapFraction)
-                        + ") — outside home button area");
-                return false;
-            }
-        }
-
-        return true;
+        return false;
     }
 
-    private int getNavigationMode(Context context) {
-        try {
-            int resId = context.getResources().getIdentifier(
-                    "config_navBarInteractionMode", "integer", "android");
-            if (resId != 0) {
-                return context.getResources().getInteger(resId);
+    private boolean findNonHomeKeyButton(View view, float screenX, float screenY) {
+        // Check if this view is a KeyButtonView (by class name, works across package renames)
+        String className = view.getClass().getName();
+        if (className.contains("KeyButtonView")) {
+            if (view.getVisibility() != View.VISIBLE) return false;
+
+            int[] loc = new int[2];
+            view.getLocationOnScreen(loc);
+            boolean inBounds = screenX >= loc[0] && screenX <= loc[0] + view.getWidth()
+                    && screenY >= loc[1] && screenY <= loc[1] + view.getHeight();
+
+            if (inBounds) {
+                int keyCode = getKeyButtonCode(view);
+                // HOME=3 is the only button we want to trigger on
+                return keyCode != KeyEvent.KEYCODE_HOME;
             }
-        } catch (Throwable t) {
-            log("Error reading nav mode from resource: " + t.getMessage());
         }
 
+        // Recurse into children
+        if (view instanceof ViewGroup) {
+            ViewGroup group = (ViewGroup) view;
+            for (int i = 0; i < group.getChildCount(); i++) {
+                if (findNonHomeKeyButton(group.getChildAt(i), screenX, screenY)) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
+    private int getKeyButtonCode(View keyButtonView) {
         try {
-            return android.provider.Settings.Secure.getInt(
-                    context.getContentResolver(), "navigation_mode", NAV_MODE_3BUTTON);
+            // KeyButtonView stores its keycode in mCode field
+            Field codeField = keyButtonView.getClass().getDeclaredField("mCode");
+            codeField.setAccessible(true);
+            return codeField.getInt(keyButtonView);
         } catch (Throwable t) {
-            log("Error reading nav mode from settings: " + t.getMessage());
+            log("Could not read mCode from " + keyButtonView.getClass().getName()
+                    + ": " + t.getMessage());
         }
-
-        return NAV_MODE_3BUTTON;
+        return -1;
     }
 
     // =========================================================================
     // Screen lock methods (shared by both hooks)
     // =========================================================================
 
+    /**
+     * Lock the screen. Strategy depends on the calling process:
+     * - SystemUI: has INJECT_EVENTS + DEVICE_POWER → try injection first
+     * - Launcher3: no system permissions → skip injection, use goToSleep/shell/root
+     */
     private void lockScreen(Context context, View view) {
-        if (isSystemUiProcess) {
-            // SystemUI has INJECT_EVENTS and DEVICE_POWER permissions
+        // Detect process at runtime (more reliable than a flag)
+        String pkg = context.getPackageName();
+        log("lockScreen from package=" + pkg);
+
+        if ("com.android.systemui".equals(pkg)) {
             if (!tryInjectSleepKey(context)) {
                 if (!tryGoToSleep(context)) {
                     tryShellSleepCommand();
                 }
             }
         } else {
-            // Launcher3 lacks system permissions — KEYCODE_SLEEP injection silently fails.
-            // Try goToSleep first (works on some ROMs), then shell, then root.
+            // Launcher3: KEYCODE_SLEEP injection silently fails (no INJECT_EVENTS permission)
+            log("Non-SystemUI process — skipping injection, trying goToSleep/shell/root");
             if (!tryGoToSleep(context)) {
                 tryShellSleepCommand();
             }
         }
 
-        // Verify lock worked; if not, retry with root
-        view.postDelayed(() -> {
+        // Verify lock worked after a short delay; if screen is still on, use root
+        final Context ctx = context.getApplicationContext();
+        new Thread(() -> {
             try {
-                PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+                Thread.sleep(300);
+                PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
                 if (pm != null && pm.isInteractive()) {
                     log("Screen still on after lock attempt — trying root fallback");
                     tryRootSleepCommand();
                 }
-            } catch (Throwable ignored) {}
-        }, 250);
+            } catch (Throwable t) {
+                log("Root fallback check failed: " + t.getMessage());
+            }
+        }).start();
     }
 
     private boolean tryInjectSleepKey(Context context) {
@@ -402,7 +430,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private void tryShellSleepCommand() {
         try {
-            log("Trying shell command fallback...");
+            log("Trying shell command...");
             Runtime.getRuntime().exec(new String[]{"input", "keyevent", "223"});
             log("Shell command dispatched");
         } catch (Throwable t) {
