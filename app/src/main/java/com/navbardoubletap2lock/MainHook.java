@@ -11,7 +11,6 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
-import android.view.ViewGroup;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -38,61 +37,47 @@ public class MainHook implements IXposedHookLoadPackage {
         Log.d(TAG, msg);
     }
 
-    // Touch state for gesture nav (NSWV hook — uses rawX/rawY)
-    private float downRawX, downRawY;
-    private long downTime;
-    private long lastTapTime;
+    // Shared lock cooldown timestamp
     private long lastLockTime;
 
-    // Touch state for 3-button nav (NavigationBarFrame hook — uses view-local coords)
+    // Touch state for gesture nav (TaskbarDragLayer hook — view-local coords)
+    private float taskbarDownX, taskbarDownY;
+    private long taskbarDownTime;
+    private long taskbarLastTapTime;
+
+    // Touch state for 3-button nav (NavigationBarFrame hook — view-local coords)
     private float frameDownX, frameDownY;
     private long frameDownTime;
     private long frameLastTapTime;
 
-    // Screen metrics for nav region filtering
-    private volatile int screenHeight = -1;
-    private volatile int navRegionThreshold = -1;
-
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
-        if (!"com.android.systemui".equals(lpparam.packageName)) {
+        if ("com.android.systemui".equals(lpparam.packageName)) {
+            log("Loaded in SystemUI");
+            // 3-button nav: NavigationBarFrame hook
+            hookNavigationBarFrame(lpparam.classLoader);
             return;
         }
 
-        log("Loaded in SystemUI");
-
-        // 1. Gesture nav: NotificationShadeWindowView hook (primary)
-        hookNotificationShadeWindowView(lpparam.classLoader);
-
-        // 2. 3-button nav: NavigationBarFrame hook (fallback)
-        hookNavigationBarFrame(lpparam.classLoader);
-    }
-
-    // --- NotificationShadeWindowView hook (gesture navigation) ---
-
-    private Class<?> findNotificationShadeWindowViewClass(ClassLoader cl) {
-        String[] paths = {
-                "com.android.systemui.shade.NotificationShadeWindowView",           // Android 13+
-                "com.android.systemui.statusbar.phone.NotificationShadeWindowView", // Android 11-12
-        };
-        for (String path : paths) {
-            try {
-                Class<?> cls = Class.forName(path, false, cl);
-                log("Found NotificationShadeWindowView at " + path);
-                return cls;
-            } catch (ClassNotFoundException ignored) {
-            }
+        if ("com.android.launcher3".equals(lpparam.packageName)) {
+            log("Loaded in Launcher3");
+            // Gesture nav: TaskbarDragLayer hook
+            hookTaskbarDragLayer(lpparam.classLoader);
+            return;
         }
-        log("NotificationShadeWindowView not found");
-        return null;
     }
 
-    private void hookNotificationShadeWindowView(ClassLoader classLoader) {
-        Class<?> nswvClass = findNotificationShadeWindowViewClass(classLoader);
-        if (nswvClass == null) return;
+    // =========================================================================
+    // Gesture navigation: TaskbarDragLayer hook (runs in com.android.launcher3)
+    // =========================================================================
 
+    private void hookTaskbarDragLayer(ClassLoader classLoader) {
         try {
-            Method dispatchTouchEvent = nswvClass.getMethod(
+            Class<?> dragLayerClass = Class.forName(
+                    "com.android.launcher3.taskbar.TaskbarDragLayer", false, classLoader);
+            log("Found TaskbarDragLayer");
+
+            Method dispatchTouchEvent = dragLayerClass.getMethod(
                     "dispatchTouchEvent", MotionEvent.class);
 
             XposedBridge.hookMethod(dispatchTouchEvent, new XC_MethodHook() {
@@ -101,139 +86,77 @@ public class MainHook implements IXposedHookLoadPackage {
                     try {
                         View view = (View) param.thisObject;
                         MotionEvent event = (MotionEvent) param.args[0];
-                        handleNavRegionTouch(view, event);
-                        // IMPORTANT: never call param.setResult() — event must not be consumed
+                        handleTaskbarTouch(view, event);
+                        // IMPORTANT: never consume — let normal gesture nav work
                     } catch (Throwable t) {
-                        log("Error in NSWV hook: " + t.getMessage());
+                        log("Error in TaskbarDragLayer hook: " + t.getMessage());
                     }
                 }
             });
-            log("Hooked NotificationShadeWindowView.dispatchTouchEvent");
+            log("Hooked TaskbarDragLayer.dispatchTouchEvent");
         } catch (Throwable t) {
-            log("Failed to hook NotificationShadeWindowView: " + t.getMessage());
+            log("Failed to hook TaskbarDragLayer: " + t.getMessage());
         }
     }
 
-    private void initScreenMetrics(View view) {
-        if (screenHeight > 0) return;
-        try {
-            Context ctx = view.getContext();
-            android.view.WindowManager wm = (android.view.WindowManager)
-                    ctx.getSystemService(Context.WINDOW_SERVICE);
-            android.graphics.Point realSize = new android.graphics.Point();
-            wm.getDefaultDisplay().getRealSize(realSize);
-            screenHeight = realSize.y;
-
-            int resId = ctx.getResources().getIdentifier(
-                    "navigation_bar_height", "dimen", "android");
-            int navBarHeight = (resId != 0)
-                    ? ctx.getResources().getDimensionPixelSize(resId)
-                    : 84;
-
-            // Nav region = bottom navBarHeight*1.8 pixels (tolerance for imprecise taps)
-            navRegionThreshold = screenHeight - (int) (navBarHeight * 1.8f);
-            log("Screen metrics: screenH=" + screenHeight
-                    + " navBarH=" + navBarHeight
-                    + " threshold=" + navRegionThreshold);
-        } catch (Throwable t) {
-            screenHeight = 3216;
-            navRegionThreshold = 3216 - 151;
-            log("Screen metrics fallback: " + t.getMessage());
-        }
-    }
-
-    private volatile int debugTouchCount = 0;
-    private static final int DEBUG_MAX_LOG = 30;
-
-    private void handleNavRegionTouch(View view, MotionEvent event) {
-        initScreenMetrics(view);
-
+    private void handleTaskbarTouch(View view, MotionEvent event) {
         int action = event.getActionMasked();
-
-        // Debug: log first N touches to see what's reaching the hook
-        if (action == MotionEvent.ACTION_DOWN && debugTouchCount < DEBUG_MAX_LOG) {
-            debugTouchCount++;
-            log("DEBUG-TOUCH#" + debugTouchCount + ": DOWN rawY=" + event.getRawY()
-                    + " rawX=" + event.getRawX()
-                    + " threshold=" + navRegionThreshold
-                    + " inRegion=" + (event.getRawY() >= navRegionThreshold));
-        }
 
         switch (action) {
             case MotionEvent.ACTION_DOWN:
-                if (event.getRawY() < navRegionThreshold) {
-                    downTime = 0; // outside nav region — ignore
-                    return;
-                }
-                downRawX = event.getRawX();
-                downRawY = event.getRawY();
-                downTime = event.getEventTime();
-                log("DEBUG: Nav region tap started at rawY=" + downRawY);
+                taskbarDownX = event.getX();
+                taskbarDownY = event.getY();
+                taskbarDownTime = event.getEventTime();
                 break;
 
             case MotionEvent.ACTION_MOVE:
-                if (downTime == 0) return;
-                float moveDx = event.getRawX() - downRawX;
-                float moveDy = event.getRawY() - downRawY;
+                if (taskbarDownTime == 0) return;
+                float moveDx = event.getX() - taskbarDownX;
+                float moveDy = event.getY() - taskbarDownY;
                 if (Math.sqrt(moveDx * moveDx + moveDy * moveDy) > TAP_MAX_DISTANCE) {
-                    // Finger moved too far — this is a swipe (home gesture, etc.)
-                    downTime = 0;
-                    lastTapTime = 0;
+                    taskbarDownTime = 0;
+                    taskbarLastTapTime = 0;
                 }
                 break;
 
             case MotionEvent.ACTION_UP:
-                if (downTime == 0) break;
-                long duration = event.getEventTime() - downTime;
-                float upDx = event.getRawX() - downRawX;
-                float upDy = event.getRawY() - downRawY;
-                float dist = (float) Math.sqrt(upDx * upDx + upDy * upDy);
+                if (taskbarDownTime == 0) break;
+                long duration = event.getEventTime() - taskbarDownTime;
+                float dx = event.getX() - taskbarDownX;
+                float dy = event.getY() - taskbarDownY;
+                float dist = (float) Math.sqrt(dx * dx + dy * dy);
 
-                log("DEBUG: UP duration=" + duration + " dist=" + dist
-                        + " rawY=" + event.getRawY()
-                        + " qualifies=" + (duration <= TAP_MAX_DURATION
-                        && dist <= TAP_MAX_DISTANCE
-                        && event.getRawY() >= navRegionThreshold));
-
-                // UP must also be in nav region (rejects upward swipes)
-                if (duration <= TAP_MAX_DURATION
-                        && dist <= TAP_MAX_DISTANCE
-                        && event.getRawY() >= navRegionThreshold) {
-
+                if (duration <= TAP_MAX_DURATION && dist <= TAP_MAX_DISTANCE) {
                     long now = event.getEventTime();
                     int doubleTapTimeout = ViewConfiguration.getDoubleTapTimeout();
 
-                    log("DEBUG: Tap qualified! lastTapTime=" + lastTapTime
-                            + " gap=" + (now - lastTapTime)
-                            + " doubleTapTimeout=" + doubleTapTimeout);
-
-                    if (lastTapTime > 0 && (now - lastTapTime) <= doubleTapTimeout) {
-                        lastTapTime = 0;
-
+                    if (taskbarLastTapTime > 0 && (now - taskbarLastTapTime) <= doubleTapTimeout) {
+                        taskbarLastTapTime = 0;
                         long currentTime = SystemClock.uptimeMillis();
                         if (currentTime - lastLockTime >= LOCK_COOLDOWN_MS) {
                             lastLockTime = currentTime;
-                            log("Double tap in nav region — locking screen");
-                            Context context = view.getContext();
-                            lockScreen(context, view);
+                            log("Double tap on taskbar — locking screen");
+                            lockScreen(view.getContext(), view);
                         }
                     } else {
-                        lastTapTime = now;
+                        taskbarLastTapTime = now;
                     }
                 } else {
-                    lastTapTime = 0;
+                    taskbarLastTapTime = 0;
                 }
-                downTime = 0;
+                taskbarDownTime = 0;
                 break;
 
             case MotionEvent.ACTION_CANCEL:
-                downTime = 0;
-                lastTapTime = 0;
+                taskbarDownTime = 0;
+                taskbarLastTapTime = 0;
                 break;
         }
     }
 
-    // --- NavigationBarFrame hook (3-button navigation fallback) ---
+    // =========================================================================
+    // 3-button navigation: NavigationBarFrame hook (runs in com.android.systemui)
+    // =========================================================================
 
     private boolean hookNavigationBarFrame(ClassLoader classLoader) {
         String[] framePaths = {
@@ -278,8 +201,6 @@ public class MainHook implements IXposedHookLoadPackage {
 
         return false;
     }
-
-    // --- Double-tap detection for NavigationBarFrame (3-button mode) ---
 
     private void handleFrameTouchForDoubleTap(View navBarView, MotionEvent event) {
         int action = event.getActionMasked();
@@ -333,7 +254,7 @@ public class MainHook implements IXposedHookLoadPackage {
         int navMode = getNavigationMode(context);
 
         if (navMode == NAV_MODE_GESTURE) {
-            return true; // gesture mode uses NSWV hook with rawY filtering
+            return true;
         }
 
         // 3-button / 2-button mode: ignore taps on back and recent_apps buttons
@@ -392,7 +313,9 @@ public class MainHook implements IXposedHookLoadPackage {
         return NAV_MODE_3BUTTON;
     }
 
-    // --- Screen lock methods ---
+    // =========================================================================
+    // Screen lock methods (shared by both hooks)
+    // =========================================================================
 
     private void lockScreen(Context context, View view) {
         if (!tryInjectSleepKey(context)) {
