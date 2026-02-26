@@ -40,6 +40,9 @@ public class MainHook implements IXposedHookLoadPackage {
     // Shared lock cooldown timestamp
     private long lastLockTime;
 
+    // Track which process we're running in (affects lock strategy)
+    private boolean isSystemUiProcess;
+
     // Touch state for gesture nav (TaskbarDragLayer hook — view-local coords)
     private float taskbarDownX, taskbarDownY;
     private long taskbarDownTime;
@@ -54,6 +57,7 @@ public class MainHook implements IXposedHookLoadPackage {
     public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
         if ("com.android.systemui".equals(lpparam.packageName)) {
             log("Loaded in SystemUI");
+            isSystemUiProcess = true;
             // 3-button nav: NavigationBarFrame hook
             hookNavigationBarFrame(lpparam.classLoader);
             return;
@@ -61,6 +65,7 @@ public class MainHook implements IXposedHookLoadPackage {
 
         if ("com.android.launcher3".equals(lpparam.packageName)) {
             log("Loaded in Launcher3");
+            isSystemUiProcess = false;
             // Gesture nav: TaskbarDragLayer hook
             hookTaskbarDragLayer(lpparam.classLoader);
             return;
@@ -257,39 +262,21 @@ public class MainHook implements IXposedHookLoadPackage {
             return true;
         }
 
-        // 3-button / 2-button mode: ignore taps on back and recent_apps buttons
-        return !isTapOnExcludedButton(navBarView, tapX, tapY);
-    }
-
-    private boolean isTapOnExcludedButton(View navBarView, float tapX, float tapY) {
-        try {
-            Context context = navBarView.getContext();
-            String[] excludedIds = {"back", "recent_apps"};
-
-            int[] navLoc = new int[2];
-            navBarView.getLocationOnScreen(navLoc);
-            float screenX = navLoc[0] + tapX;
-            float screenY = navLoc[1] + tapY;
-
-            for (String id : excludedIds) {
-                int resId = context.getResources().getIdentifier(
-                        id, "id", "com.android.systemui");
-                if (resId != 0) {
-                    View button = navBarView.findViewById(resId);
-                    if (button != null && button.getVisibility() == View.VISIBLE) {
-                        int[] btnLoc = new int[2];
-                        button.getLocationOnScreen(btnLoc);
-                        if (screenX >= btnLoc[0] && screenX <= btnLoc[0] + button.getWidth()
-                                && screenY >= btnLoc[1] && screenY <= btnLoc[1] + button.getHeight()) {
-                            return true;
-                        }
-                    }
-                }
+        // 3-button mode: only allow taps in the center region (home button area).
+        // Layout is [Back | Home | Recent] — home button occupies roughly the center third.
+        // This is more reliable than resource ID lookup which varies across ROMs.
+        int viewWidth = navBarView.getWidth();
+        if (viewWidth > 0) {
+            float tapFraction = tapX / viewWidth;
+            if (tapFraction < 0.25f || tapFraction > 0.75f) {
+                log("Tap excluded: position " + String.format("%.0f", tapX)
+                        + "/" + viewWidth + " (fraction=" + String.format("%.2f", tapFraction)
+                        + ") — outside home button area");
+                return false;
             }
-        } catch (Throwable t) {
-            log("Error checking excluded buttons: " + t.getMessage());
         }
-        return false;
+
+        return true;
     }
 
     private int getNavigationMode(Context context) {
@@ -318,20 +305,31 @@ public class MainHook implements IXposedHookLoadPackage {
     // =========================================================================
 
     private void lockScreen(Context context, View view) {
-        if (!tryInjectSleepKey(context)) {
+        if (isSystemUiProcess) {
+            // SystemUI has INJECT_EVENTS and DEVICE_POWER permissions
+            if (!tryInjectSleepKey(context)) {
+                if (!tryGoToSleep(context)) {
+                    tryShellSleepCommand();
+                }
+            }
+        } else {
+            // Launcher3 lacks system permissions — KEYCODE_SLEEP injection silently fails.
+            // Try goToSleep first (works on some ROMs), then shell, then root.
             if (!tryGoToSleep(context)) {
                 tryShellSleepCommand();
             }
         }
 
+        // Verify lock worked; if not, retry with root
         view.postDelayed(() -> {
             try {
                 PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
                 if (pm != null && pm.isInteractive()) {
-                    log("WARNING: Screen still interactive 200ms after lock attempt");
+                    log("Screen still on after lock attempt — trying root fallback");
+                    tryRootSleepCommand();
                 }
             } catch (Throwable ignored) {}
-        }, 200);
+        }, 250);
     }
 
     private boolean tryInjectSleepKey(Context context) {
@@ -409,6 +407,16 @@ public class MainHook implements IXposedHookLoadPackage {
             log("Shell command dispatched");
         } catch (Throwable t) {
             log("Shell command failed: " + t.getMessage());
+        }
+    }
+
+    private void tryRootSleepCommand() {
+        try {
+            log("Trying root command...");
+            Runtime.getRuntime().exec(new String[]{"su", "-c", "input keyevent 26"});
+            log("Root command dispatched");
+        } catch (Throwable t) {
+            log("Root command failed: " + t.getMessage());
         }
     }
 }
