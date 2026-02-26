@@ -4,9 +4,6 @@ import android.content.Context;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.Log;
-import android.view.InputDevice;
-import android.view.InputEvent;
-import android.view.KeyCharacterMap;
 import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
@@ -272,20 +269,32 @@ public class MainHook implements IXposedHookLoadPackage {
         return false;
     }
 
+    private static int debugButtonLogCount = 0;
+    private static final int DEBUG_BUTTON_LOG_MAX = 3;
+
     private boolean findNonHomeKeyButton(View view, float screenX, float screenY) {
         // Check if this view is a KeyButtonView (by class name, works across package renames)
         String className = view.getClass().getName();
         if (className.contains("KeyButtonView")) {
-            if (view.getVisibility() != View.VISIBLE) return false;
-
+            int keyCode = getKeyButtonCode(view);
             int[] loc = new int[2];
             view.getLocationOnScreen(loc);
             boolean inBounds = screenX >= loc[0] && screenX <= loc[0] + view.getWidth()
                     && screenY >= loc[1] && screenY <= loc[1] + view.getHeight();
 
+            if (debugButtonLogCount < DEBUG_BUTTON_LOG_MAX) {
+                log("  KeyButtonView: " + className + " mCode=" + keyCode
+                        + " visible=" + (view.getVisibility() == View.VISIBLE)
+                        + " bounds=[" + loc[0] + "," + loc[1] + " " + view.getWidth() + "x" + view.getHeight() + "]"
+                        + " tap=[" + screenX + "," + screenY + "]"
+                        + " inBounds=" + inBounds);
+            }
+
+            if (view.getVisibility() != View.VISIBLE) return false;
+
             if (inBounds) {
-                int keyCode = getKeyButtonCode(view);
-                // HOME=3 is the only button we want to trigger on
+                log("Tap on KeyButtonView mCode=" + keyCode
+                        + " (HOME=" + KeyEvent.KEYCODE_HOME + ")");
                 return keyCode != KeyEvent.KEYCODE_HOME;
             }
         }
@@ -293,6 +302,17 @@ public class MainHook implements IXposedHookLoadPackage {
         // Recurse into children
         if (view instanceof ViewGroup) {
             ViewGroup group = (ViewGroup) view;
+
+            // Debug: log first few view trees to see what's inside NavigationBarFrame
+            if (debugButtonLogCount < DEBUG_BUTTON_LOG_MAX && view == group) {
+                boolean isRoot = className.contains("NavigationBarFrame");
+                if (isRoot) {
+                    debugButtonLogCount++;
+                    log("NavBarFrame view tree (" + group.getChildCount() + " children):");
+                    logViewTree(group, "  ");
+                }
+            }
+
             for (int i = 0; i < group.getChildCount(); i++) {
                 if (findNonHomeKeyButton(group.getChildAt(i), screenX, screenY)) {
                     return true;
@@ -301,6 +321,24 @@ public class MainHook implements IXposedHookLoadPackage {
         }
 
         return false;
+    }
+
+    private void logViewTree(ViewGroup group, String indent) {
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            String name = child.getClass().getName();
+            int keyCode = -1;
+            if (name.contains("KeyButtonView")) {
+                keyCode = getKeyButtonCode(child);
+            }
+            log(indent + name
+                    + " vis=" + (child.getVisibility() == View.VISIBLE)
+                    + " size=" + child.getWidth() + "x" + child.getHeight()
+                    + (keyCode >= 0 ? " mCode=" + keyCode : ""));
+            if (child instanceof ViewGroup) {
+                logViewTree((ViewGroup) child, indent + "  ");
+            }
+        }
     }
 
     private int getKeyButtonCode(View keyButtonView) {
@@ -321,84 +359,26 @@ public class MainHook implements IXposedHookLoadPackage {
     // =========================================================================
 
     /**
-     * Lock the screen. Strategy depends on the calling process:
-     * - SystemUI: has INJECT_EVENTS + DEVICE_POWER → try injection first
-     * - Launcher3: no system permissions → skip injection, use goToSleep/shell/root
+     * Lock the screen using root command. LSPosed requires Magisk (root),
+     * so "su" is always available. This works from ANY process — no need
+     * to detect SystemUI vs Launcher3.
      */
     private void lockScreen(Context context, View view) {
-        // Detect process at runtime (more reliable than a flag)
-        String pkg = context.getPackageName();
-        log("lockScreen from package=" + pkg);
-
-        if ("com.android.systemui".equals(pkg)) {
-            if (!tryInjectSleepKey(context)) {
-                if (!tryGoToSleep(context)) {
-                    tryShellSleepCommand();
-                }
-            }
-        } else {
-            // Launcher3: KEYCODE_SLEEP injection silently fails (no INJECT_EVENTS permission)
-            log("Non-SystemUI process — skipping injection, trying goToSleep/shell/root");
-            if (!tryGoToSleep(context)) {
-                tryShellSleepCommand();
-            }
-        }
-
-        // Verify lock worked after a short delay; if screen is still on, use root
-        final Context ctx = context.getApplicationContext();
-        new Thread(() -> {
-            try {
-                Thread.sleep(300);
-                PowerManager pm = (PowerManager) ctx.getSystemService(Context.POWER_SERVICE);
-                if (pm != null && pm.isInteractive()) {
-                    log("Screen still on after lock attempt — trying root fallback");
-                    tryRootSleepCommand();
-                }
-            } catch (Throwable t) {
-                log("Root fallback check failed: " + t.getMessage());
-            }
-        }).start();
-    }
-
-    private boolean tryInjectSleepKey(Context context) {
+        log("lockScreen v3 — using root command");
         try {
-            log("Trying KEYCODE_SLEEP injection...");
-            Object inputManager = context.getSystemService(Context.INPUT_SERVICE);
-            if (inputManager == null) {
-                log("InputManager is null from getSystemService, trying getInstance...");
+            Runtime.getRuntime().exec(new String[]{"su", "-c", "input keyevent 223"});
+            log("Root sleep command dispatched");
+        } catch (Throwable t) {
+            log("Root command failed: " + t.getMessage() + " — trying fallbacks");
+            // Fallback chain for non-root environments (unlikely with LSPosed)
+            if (!tryGoToSleep(context)) {
                 try {
-                    Method getInstance = Class.forName("android.hardware.input.InputManager")
-                            .getMethod("getInstance");
-                    inputManager = getInstance.invoke(null);
+                    Runtime.getRuntime().exec(new String[]{"input", "keyevent", "223"});
+                    log("Shell fallback dispatched");
                 } catch (Throwable t2) {
-                    log("InputManager not available: " + t2.getMessage());
-                    return false;
+                    log("All lock methods failed");
                 }
             }
-            if (inputManager == null) {
-                log("InputManager is null");
-                return false;
-            }
-
-            long now = SystemClock.uptimeMillis();
-            KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_SLEEP,
-                    0, 0, KeyCharacterMap.VIRTUAL_KEYBOARD, 0,
-                    KeyEvent.FLAG_FROM_SYSTEM, InputDevice.SOURCE_KEYBOARD);
-            KeyEvent up = KeyEvent.changeAction(down, KeyEvent.ACTION_UP);
-
-            Method injectMethod = inputManager.getClass().getMethod(
-                    "injectInputEvent", InputEvent.class, int.class);
-            injectMethod.invoke(inputManager, down, 0);
-            injectMethod.invoke(inputManager, up, 0);
-
-            log("KEYCODE_SLEEP injection completed");
-            return true;
-        } catch (Throwable t) {
-            Throwable cause = (t instanceof java.lang.reflect.InvocationTargetException && t.getCause() != null)
-                    ? t.getCause() : t;
-            log("KEYCODE_SLEEP injection failed: " + cause.getClass().getSimpleName()
-                    + ": " + cause.getMessage());
-            return false;
         }
     }
 
@@ -425,26 +405,6 @@ public class MainHook implements IXposedHookLoadPackage {
             log("goToSleep failed: " + cause.getClass().getSimpleName()
                     + ": " + cause.getMessage());
             return false;
-        }
-    }
-
-    private void tryShellSleepCommand() {
-        try {
-            log("Trying shell command...");
-            Runtime.getRuntime().exec(new String[]{"input", "keyevent", "223"});
-            log("Shell command dispatched");
-        } catch (Throwable t) {
-            log("Shell command failed: " + t.getMessage());
-        }
-    }
-
-    private void tryRootSleepCommand() {
-        try {
-            log("Trying root command...");
-            Runtime.getRuntime().exec(new String[]{"su", "-c", "input keyevent 26"});
-            log("Root command dispatched");
-        } catch (Throwable t) {
-            log("Root command failed: " + t.getMessage());
         }
     }
 }
