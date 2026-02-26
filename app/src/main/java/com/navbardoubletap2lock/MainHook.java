@@ -1,6 +1,11 @@
 package com.navbardoubletap2lock;
 
+import android.app.Application;
+import android.content.BroadcastReceiver;
 import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.Build;
 import android.os.PowerManager;
 import android.os.SystemClock;
 import android.util.Log;
@@ -8,7 +13,6 @@ import android.view.KeyEvent;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewConfiguration;
-import android.view.ViewGroup;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
 import de.robv.android.xposed.XC_MethodHook;
@@ -24,14 +28,18 @@ public class MainHook implements IXposedHookLoadPackage {
 
     private static final long TAP_MAX_DURATION = 300;
     private static final float TAP_MAX_DISTANCE = 100f;
-
     private static final long LOCK_COOLDOWN_MS = 500;
+
+    private static final String LOCK_ACTION = "com.navbardoubletap2lock.LOCK_SCREEN";
 
     private static void log(String msg) {
         String fullMsg = TAG + ": " + msg;
         XposedBridge.log(fullMsg);
         Log.d(TAG, msg);
     }
+
+    // Process identity — each process gets its own MainHook instance
+    private boolean isSystemUiProcess = false;
 
     // Shared lock cooldown timestamp
     private long lastLockTime;
@@ -46,11 +54,20 @@ public class MainHook implements IXposedHookLoadPackage {
     private long frameDownTime;
     private long frameLastTapTime;
 
+    // Button exclusion flag — set by KeyButtonView.onTouchEvent hook
+    private volatile boolean touchingNonHomeButton = false;
+
+    // Broadcast receiver registration guard
+    private boolean receiverRegistered = false;
+
     @Override
     public void handleLoadPackage(LoadPackageParam lpparam) throws Throwable {
         if ("com.android.systemui".equals(lpparam.packageName)) {
+            isSystemUiProcess = true;
             log("Loaded in SystemUI");
             hookNavigationBarFrame(lpparam.classLoader);
+            hookKeyButtonView(lpparam.classLoader);
+            hookSystemUiApplication(lpparam.classLoader);
             return;
         }
 
@@ -59,6 +76,54 @@ public class MainHook implements IXposedHookLoadPackage {
             hookTaskbarDragLayer(lpparam.classLoader);
             return;
         }
+    }
+
+    // =========================================================================
+    // SystemUI: Register broadcast receiver for cross-process lock requests
+    // =========================================================================
+
+    private void hookSystemUiApplication(ClassLoader classLoader) {
+        try {
+            XposedBridge.hookMethod(
+                    Application.class.getDeclaredMethod("onCreate"),
+                    new XC_MethodHook() {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            if (receiverRegistered) return;
+                            try {
+                                Application app = (Application) param.thisObject;
+                                registerLockReceiver(app.getApplicationContext());
+                            } catch (Throwable t) {
+                                log("Failed to register lock receiver: " + t.getMessage());
+                            }
+                        }
+                    });
+            log("Hooked Application.onCreate for broadcast receiver registration");
+        } catch (Throwable t) {
+            log("Failed to hook Application.onCreate: " + t.getMessage());
+        }
+    }
+
+    private void registerLockReceiver(Context context) {
+        if (context == null || receiverRegistered) return;
+
+        BroadcastReceiver receiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context ctx, Intent intent) {
+                log("Lock broadcast received in SystemUI");
+                tryGoToSleep(ctx);
+            }
+        };
+
+        IntentFilter filter = new IntentFilter(LOCK_ACTION);
+        if (Build.VERSION.SDK_INT >= 33) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_EXPORTED);
+        } else {
+            context.registerReceiver(receiver, filter);
+        }
+
+        receiverRegistered = true;
+        log("Lock broadcast receiver registered in SystemUI");
     }
 
     // =========================================================================
@@ -129,7 +194,7 @@ public class MainHook implements IXposedHookLoadPackage {
                         if (currentTime - lastLockTime >= LOCK_COOLDOWN_MS) {
                             lastLockTime = currentTime;
                             log("Double tap on taskbar — locking screen");
-                            lockScreen(view.getContext(), view);
+                            lockScreen(view.getContext());
                         }
                     } else {
                         taskbarLastTapTime = now;
@@ -151,7 +216,7 @@ public class MainHook implements IXposedHookLoadPackage {
     // 3-button navigation: NavigationBarFrame hook (runs in com.android.systemui)
     // =========================================================================
 
-    private boolean hookNavigationBarFrame(ClassLoader classLoader) {
+    private void hookNavigationBarFrame(ClassLoader classLoader) {
         String[] framePaths = {
                 "com.android.systemui.navigationbar.views.NavigationBarFrame", // Android 16+
                 "com.android.systemui.navigationbar.NavigationBarFrame",       // Android 12L-15
@@ -181,18 +246,16 @@ public class MainHook implements IXposedHookLoadPackage {
                     });
 
                     log("Hooked NavigationBarFrame.dispatchTouchEvent");
-                    return true;
+                    return;
 
                 } catch (NoSuchMethodException e) {
                     log("NavigationBarFrame found but no dispatchTouchEvent override");
-                    return true;
+                    return;
                 }
 
             } catch (ClassNotFoundException ignored) {
             }
         }
-
-        return false;
     }
 
     private void handleFrameTouchForDoubleTap(View navBarView, MotionEvent event) {
@@ -223,15 +286,15 @@ public class MainHook implements IXposedHookLoadPackage {
                             break;
                         }
 
-                        // Exclude taps on back/recent buttons — only allow home button area
-                        if (isTapOnNonHomeButton(navBarView, frameDownX, frameDownY)) {
-                            log("Double tap excluded — tap is on back/recent button");
+                        // Exclude taps on back/recent buttons
+                        if (touchingNonHomeButton) {
+                            log("Double tap excluded — on non-home button");
                             break;
                         }
 
                         lastLockTime = currentTime;
                         log("Double tap detected on NavigationBarFrame — locking screen");
-                        lockScreen(navBarView.getContext(), navBarView);
+                        lockScreen(navBarView.getContext());
                     } else {
                         frameLastTapTime = now;
                     }
@@ -247,137 +310,93 @@ public class MainHook implements IXposedHookLoadPackage {
     }
 
     // =========================================================================
-    // 3-button nav: exclude taps on Back/Recent buttons via KeyButtonView.mCode
+    // 3-button nav: KeyButtonView hook for button exclusion
     // =========================================================================
 
-    /**
-     * Walk the view hierarchy under navBarView, find KeyButtonView descendants,
-     * and check if the tap landed on one whose mCode != KEYCODE_HOME.
-     * Returns true if tap is on a non-home KeyButtonView (back, recent, etc.).
-     */
-    private boolean isTapOnNonHomeButton(View navBarView, float tapX, float tapY) {
-        try {
-            int[] navLoc = new int[2];
-            navBarView.getLocationOnScreen(navLoc);
-            float screenX = navLoc[0] + tapX;
-            float screenY = navLoc[1] + tapY;
+    private void hookKeyButtonView(ClassLoader classLoader) {
+        String[] keyButtonPaths = {
+                "com.android.systemui.navigationbar.buttons.KeyButtonView", // Android 16+
+                "com.android.systemui.statusbar.policy.KeyButtonView",      // older
+        };
 
-            return findNonHomeKeyButton(navBarView, screenX, screenY);
-        } catch (Throwable t) {
-            log("Error in button exclusion: " + t.getMessage());
-        }
-        return false;
-    }
+        for (String path : keyButtonPaths) {
+            try {
+                Class<?> kbvClass = Class.forName(path, false, classLoader);
+                log("Found KeyButtonView at " + path);
 
-    private static int debugButtonLogCount = 0;
-    private static final int DEBUG_BUTTON_LOG_MAX = 3;
+                XposedBridge.hookMethod(
+                        kbvClass.getMethod("onTouchEvent", MotionEvent.class),
+                        new XC_MethodHook() {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                try {
+                                    MotionEvent event = (MotionEvent) param.args[0];
+                                    if (event.getActionMasked() == MotionEvent.ACTION_DOWN) {
+                                        View btn = (View) param.thisObject;
+                                        int mCode = getKeyButtonCode(btn);
+                                        touchingNonHomeButton = (mCode != KeyEvent.KEYCODE_HOME && mCode > 0);
+                                        log("KeyButtonView touched mCode=" + mCode
+                                                + " nonHome=" + touchingNonHomeButton);
+                                    }
+                                } catch (Throwable t) {
+                                    log("Error in KeyButtonView hook: " + t.getMessage());
+                                }
+                            }
+                        });
 
-    private boolean findNonHomeKeyButton(View view, float screenX, float screenY) {
-        // Check if this view is a KeyButtonView (by class name, works across package renames)
-        String className = view.getClass().getName();
-        if (className.contains("KeyButtonView")) {
-            int keyCode = getKeyButtonCode(view);
-            int[] loc = new int[2];
-            view.getLocationOnScreen(loc);
-            boolean inBounds = screenX >= loc[0] && screenX <= loc[0] + view.getWidth()
-                    && screenY >= loc[1] && screenY <= loc[1] + view.getHeight();
+                log("Hooked KeyButtonView.onTouchEvent");
+                return;
 
-            if (debugButtonLogCount < DEBUG_BUTTON_LOG_MAX) {
-                log("  KeyButtonView: " + className + " mCode=" + keyCode
-                        + " visible=" + (view.getVisibility() == View.VISIBLE)
-                        + " bounds=[" + loc[0] + "," + loc[1] + " " + view.getWidth() + "x" + view.getHeight() + "]"
-                        + " tap=[" + screenX + "," + screenY + "]"
-                        + " inBounds=" + inBounds);
-            }
-
-            if (view.getVisibility() != View.VISIBLE) return false;
-
-            if (inBounds) {
-                log("Tap on KeyButtonView mCode=" + keyCode
-                        + " (HOME=" + KeyEvent.KEYCODE_HOME + ")");
-                return keyCode != KeyEvent.KEYCODE_HOME;
+            } catch (ClassNotFoundException ignored) {
+            } catch (NoSuchMethodException e) {
+                log("KeyButtonView found but no onTouchEvent: " + e.getMessage());
+            } catch (Throwable t) {
+                log("Failed to hook KeyButtonView: " + t.getMessage());
             }
         }
 
-        // Recurse into children
-        if (view instanceof ViewGroup) {
-            ViewGroup group = (ViewGroup) view;
-
-            // Debug: log first few view trees to see what's inside NavigationBarFrame
-            if (debugButtonLogCount < DEBUG_BUTTON_LOG_MAX && view == group) {
-                boolean isRoot = className.contains("NavigationBarFrame");
-                if (isRoot) {
-                    debugButtonLogCount++;
-                    log("NavBarFrame view tree (" + group.getChildCount() + " children):");
-                    logViewTree(group, "  ");
-                }
-            }
-
-            for (int i = 0; i < group.getChildCount(); i++) {
-                if (findNonHomeKeyButton(group.getChildAt(i), screenX, screenY)) {
-                    return true;
-                }
-            }
-        }
-
-        return false;
-    }
-
-    private void logViewTree(ViewGroup group, String indent) {
-        for (int i = 0; i < group.getChildCount(); i++) {
-            View child = group.getChildAt(i);
-            String name = child.getClass().getName();
-            int keyCode = -1;
-            if (name.contains("KeyButtonView")) {
-                keyCode = getKeyButtonCode(child);
-            }
-            log(indent + name
-                    + " vis=" + (child.getVisibility() == View.VISIBLE)
-                    + " size=" + child.getWidth() + "x" + child.getHeight()
-                    + (keyCode >= 0 ? " mCode=" + keyCode : ""));
-            if (child instanceof ViewGroup) {
-                logViewTree((ViewGroup) child, indent + "  ");
-            }
-        }
+        log("KeyButtonView not found — button exclusion disabled");
     }
 
     private int getKeyButtonCode(View keyButtonView) {
         try {
-            // KeyButtonView stores its keycode in mCode field
-            Field codeField = keyButtonView.getClass().getDeclaredField("mCode");
-            codeField.setAccessible(true);
-            return codeField.getInt(keyButtonView);
+            // Walk up the class hierarchy to find mCode field
+            Class<?> cls = keyButtonView.getClass();
+            while (cls != null && cls != View.class) {
+                try {
+                    Field codeField = cls.getDeclaredField("mCode");
+                    codeField.setAccessible(true);
+                    return codeField.getInt(keyButtonView);
+                } catch (NoSuchFieldException e) {
+                    cls = cls.getSuperclass();
+                }
+            }
+            log("mCode field not found in class hierarchy of "
+                    + keyButtonView.getClass().getName());
         } catch (Throwable t) {
-            log("Could not read mCode from " + keyButtonView.getClass().getName()
-                    + ": " + t.getMessage());
+            log("Could not read mCode: " + t.getMessage());
         }
         return -1;
     }
 
     // =========================================================================
-    // Screen lock methods (shared by both hooks)
+    // Screen lock (shared by both hooks)
     // =========================================================================
 
-    /**
-     * Lock the screen using root command. LSPosed requires Magisk (root),
-     * so "su" is always available. This works from ANY process — no need
-     * to detect SystemUI vs Launcher3.
-     */
-    private void lockScreen(Context context, View view) {
-        log("lockScreen v3 — using root command");
-        try {
-            Runtime.getRuntime().exec(new String[]{"su", "-c", "input keyevent 223"});
-            log("Root sleep command dispatched");
-        } catch (Throwable t) {
-            log("Root command failed: " + t.getMessage() + " — trying fallbacks");
-            // Fallback chain for non-root environments (unlikely with LSPosed)
-            if (!tryGoToSleep(context)) {
-                try {
-                    Runtime.getRuntime().exec(new String[]{"input", "keyevent", "223"});
-                    log("Shell fallback dispatched");
-                } catch (Throwable t2) {
-                    log("All lock methods failed");
-                }
+    private void lockScreen(Context context) {
+        if (isSystemUiProcess) {
+            // SystemUI has DEVICE_POWER permission — call goToSleep directly
+            log("lockScreen — direct goToSleep (SystemUI process)");
+            tryGoToSleep(context);
+        } else {
+            // Launcher3 (or other) — send broadcast to SystemUI
+            log("lockScreen — sending broadcast to SystemUI");
+            try {
+                Intent intent = new Intent(LOCK_ACTION);
+                context.sendBroadcast(intent);
+                log("Lock broadcast sent from Launcher3");
+            } catch (Throwable t) {
+                log("Failed to send lock broadcast: " + t.getMessage());
             }
         }
     }
@@ -385,9 +404,11 @@ public class MainHook implements IXposedHookLoadPackage {
     private boolean tryGoToSleep(Context context) {
         try {
             PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
-            if (pm == null) return false;
+            if (pm == null) {
+                log("PowerManager is null");
+                return false;
+            }
 
-            log("Trying goToSleep...");
             try {
                 Method goToSleep = PowerManager.class.getMethod(
                         "goToSleep", long.class, int.class, int.class);
